@@ -1,6 +1,6 @@
--- Luau | snyx_aimbot_v2_3.lua | Roblox executor (Synapse-style env)
+-- Luau | snyx_aimbot_v2_4.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3 — ANTI-PHANTOM-KICK PASS)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4 — ZOOM-AWARE PASS)
 -- PART 1: Core Setup, Cleanup, State, Weapon & Visibility Service
 -- =====================================================================
 
@@ -89,6 +89,12 @@ local State = {
 
 local function getCamera() return Workspace.CurrentCamera end
 
+local DEFAULT_FOV = 70
+
+local function getZoomScale(camera)
+        return math.clamp(DEFAULT_FOV / math.max(camera.FieldOfView, 1), 1, 5)
+end
+
 local function getPing()
         if not LocalPlayer then return 0.025 end
         local success, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
@@ -163,7 +169,7 @@ function WeaponService:UpdateAuto()
                 end
         end
 
-    WeaponCache[tool] = { Speed = speed, Gravity = gravity }
+        WeaponCache[tool] = { Speed = speed, Gravity = gravity }
         self.Speed = speed
         self.Gravity = gravity
 end
@@ -274,6 +280,9 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
         return false
 end
 
+-- ==========================================
+-- 5.1 ENEMY VALIDITY (Component Cache)
+-- ==========================================
 local PlayerCache = setmetatable({}, { __mode = "k" })
 
 local function getComponents(player)
@@ -319,7 +328,7 @@ CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(fu
         PlayerCache[player] = nil
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4)
 -- PART 2: Target Service, Prediction Engine & ESP Service
 -- =====================================================================
 
@@ -425,9 +434,9 @@ local MAX_ACCEL = 200
 local ACCEL_TAU_BASE = 0.10
 local MAX_ACCEL_LEAD = 12
 
-local function clampAccelLead(v3)
+local function clampAccelLead(v3, cap)
         local m = v3.Magnitude
-        if m > MAX_ACCEL_LEAD then return v3 * (MAX_ACCEL_LEAD / m) end
+        if m > cap then return v3 * (cap / m) end
         return v3
 end
 
@@ -512,7 +521,7 @@ local function getTargetAcceleration(kinPart, targetVel, currentTime)
         return state.smoothedAcceleration
 end
 
-local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec, deltaTime)
+local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec, deltaTime, leadTime)
         if typeof(bulletSpeed) ~= "number" or bulletSpeed <= 0 then return nil end
         if typeof(shooterPos) ~= "Vector3" then return nil end
         if typeof(bulletGravityVec) ~= "Vector3" then return nil end
@@ -524,12 +533,14 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
 
         local kinPart = getKinematicPart(targetPart)
         local targetVel = kinPart.AssemblyLinearVelocity
-        local pingOffset = State.PingCompensation and (getPing() * 0.5) or 0
+        local pingOffset = (State.PingCompensation and (getPing() * 0.5) or 0) + (leadTime or 0)
         local targetAcc = getTargetAcceleration(kinPart, targetVel, currentTime)
+
+        local accelLeadCap = MAX_ACCEL_LEAD / getZoomScale(getCamera())
 
         local function f(t)
                 local totalT = t + pingOffset
-                local targetAtT = targetPos + (targetVel * totalT) + clampAccelLead(0.5 * targetAcc * (totalT ^ 2))
+                local targetAtT = targetPos + (targetVel * totalT) + clampAccelLead(0.5 * targetAcc * (totalT ^ 2), accelLeadCap)
                 local bulletDropAtT = 0.5 * bulletGravityVec * (t ^ 2)
                 local requiredDisplacement = targetAtT - shooterPos - bulletDropAtT
                 return (bulletSpeed * t) - requiredDisplacement.Magnitude
@@ -572,7 +583,7 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
         end
 
         local finalT = t_intercept + pingOffset
-        local finalTargetPos = targetPos + (targetVel * finalT) + clampAccelLead(0.5 * targetAcc * (finalT ^ 2))
+        local finalTargetPos = targetPos + (targetVel * finalT) + clampAccelLead(0.5 * targetAcc * (finalT ^ 2), accelLeadCap)
         local displacement = finalTargetPos - shooterPos
 
         if t_intercept > 0 then
@@ -586,9 +597,18 @@ end
 
 local lastGravVal, lastGravVec = nil, nil
 
-local function getPredictedPosition(targetPart, shooterPos, deltaTime)
+local function getPredictedPosition(targetPart, shooterPos, deltaTime, leadTime)
         local targetPos = targetPart.Position
-        if not State.Prediction then return targetPos end
+        if not State.Prediction then
+                if leadTime and leadTime > 0 then
+                        local kinPart = getKinematicPart(targetPart)
+                        local vel = kinPart and kinPart.AssemblyLinearVelocity
+                        if vel and vel.Magnitude > 1e-3 then
+                                targetPos += vel * leadTime
+                        end
+                end
+                return targetPos
+        end
 
         if lastGravVal ~= WeaponService.Gravity then
                 lastGravVal = WeaponService.Gravity
@@ -596,7 +616,7 @@ local function getPredictedPosition(targetPart, shooterPos, deltaTime)
         end
 
         local bulletSpeed = math.max(WeaponService.Speed, 1)
-        local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, lastGravVec, deltaTime)
+        local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, lastGravVec, deltaTime, leadTime)
         if aimDirection then return shooterPos + (aimDirection * 10000) end
 
         return targetPos
@@ -751,7 +771,7 @@ CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt
         end
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4)
 -- PART 3: Main Camera Engine & UI Construction
 -- =====================================================================
 
@@ -810,26 +830,20 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
         local targetPart = TargetService.TargetPart
         if TargetService.CurrentTarget and targetPart and targetPart.Parent then
                 local shooterPos = camera.CFrame.Position
-                local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime)
 
-                local baseSpeed = math.clamp(State.Smoothness * 120, 6, 300)
+                local zoomScale = getZoomScale(camera)
+                local baseSpeed = math.clamp(State.Smoothness * 120 * zoomScale, 6, 400)
 
-                if State.LagComp then
-                        local tau = math.min(1 / baseSpeed, 0.15)
-                        local kinPart = getKinematicPart(targetPart)
-                        local vel = kinPart and kinPart.AssemblyLinearVelocity
-                        if vel and vel.Magnitude > 1e-3 then
-                                targetPos += vel * tau
-                        end
-                end
+                local leadTau = State.LagComp and math.min(1 / baseSpeed, 0.15) or 0
+                local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime, leadTau)
 
                 local desiredDirection = safeUnit(targetPos - shooterPos)
                 if desiredDirection then
                         local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
                         local errDeg = math.deg(math.acos(dot))
                         local boostC = State.TrackBoost or 1.5
-                        local boost = 1 + math.min(errDeg / 10, 2) * boostC
-                        local effSpeed = math.min(baseSpeed * boost, 360)
+                        local boost = 1 + math.min(errDeg * zoomScale / 10, 2) * boostC
+                        local effSpeed = math.min(baseSpeed * boost, 480)
 
                         local alpha = 1 - math.exp(-effSpeed * deltaTime)
                         local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha))
