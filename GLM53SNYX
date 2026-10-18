@@ -1,6 +1,6 @@
--- Luau | snyx_aimbot_v2_5.lua | Roblox executor (Synapse-style env)
+-- Luau | snyx_aimbot_v2_6.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5 — SNAP + DRAG-SWITCH PASS)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.6 — SMOOTHNESS PASS)
 -- PART 1: Core Setup, Cleanup, State, Zoom Scale, Weapon & Visibility Service
 -- =====================================================================
 
@@ -330,7 +330,7 @@ CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(fu
         PlayerCache[player] = nil
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.6)
 -- PART 2: Target Service, Prediction Engine & ESP Service
 -- =====================================================================
 
@@ -773,7 +773,7 @@ CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt
         end
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.6)
 -- PART 3: Main Camera Engine & UI Construction
 -- =====================================================================
 
@@ -794,27 +794,24 @@ local function hasActiveWeapon()
 end
 
 local flickUntil = 0
-CleanupManager:AddConn("FlickDetect", UserInputService.InputChanged:Connect(function(input)
-        if not State.DragSwitch then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement
-                or input.UserInputType == Enum.UserInputType.Touch then
-                local d = input.Delta
-                if d then
-                        local camera = getCamera()
-                        local vpX = camera and camera.ViewportSize.X or 1920
-                        local thresh = math.max(18, vpX * 0.012)
-                        if (math.abs(d.X) + math.abs(d.Y)) > thresh then
-                                flickUntil = os.clock() + 0.18
-                        end
-                end
-        end
-end))
+local lastAimLook = nil
+local FLICK_DEG_PER_SEC = 180
+local FLICK_HOLD = 0.12
 
 local frameTick = 0
 
 CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
         local camera = getCamera()
         if not camera then return end
+
+        if lastAimLook then
+                local uDot = math.clamp(camera.CFrame.LookVector:Dot(lastAimLook), -1, 1)
+                local uDeg = math.deg(math.acos(uDot))
+                if uDeg > 0.5 and (uDeg / math.max(deltaTime, 1e-4)) > FLICK_DEG_PER_SEC then
+                        flickUntil = os.clock() + FLICK_HOLD
+                end
+        end
+        lastAimLook = nil
 
         local vp = camera.ViewportSize
         local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
@@ -866,19 +863,21 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                         local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
                         local errDeg = math.deg(math.acos(dot))
                         local snapAngle = State.SnapAngle or 20
-                        local alpha
-                        if snapAngle > 0 and errDeg * zoomScale >= snapAngle then
-                                alpha = 1
-                        else
-                                local boostC = State.TrackBoost or 1.5
-                                local boost = 1 + math.min(errDeg * zoomScale / 10, 2) * boostC
-                                local effSpeed = math.min(baseSpeed * boost, 480)
-                                alpha = 1 - math.exp(-effSpeed * deltaTime)
+                        local errScaled = errDeg * zoomScale
+                        local boostC = State.TrackBoost or 1.5
+                        local boost = 1 + math.min(errScaled / 10, 2) * boostC
+                        local effSpeed = math.min(baseSpeed * boost, 480)
+                        local normalAlpha = 1 - math.exp(-effSpeed * deltaTime)
+                        local alpha = normalAlpha
+                        if snapAngle > 0 then
+                                local snapBlend = math.clamp((errScaled - snapAngle * 0.5) / (snapAngle * 0.5), 0, 1)
+                                alpha = normalAlpha + (1 - normalAlpha) * snapBlend * snapBlend
                         end
 
                         local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha))
                         if smoothDirection then
                                 camera.CFrame = CFrame.lookAt(shooterPos, shooterPos + smoothDirection)
+                                lastAimLook = smoothDirection
                         end
                 end
         end
