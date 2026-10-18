@@ -1,10 +1,7 @@
--- Luau | snyx_aimbot_v2_2.lua | Roblox executor (Synapse-style env)
+-- Luau | snyx_aimbot_v2_3.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.2 — TRACKING SPEED PASS)
--- - Remap Smoothness → lerpSpeed ใหม่ (×120 cap 300 — เดิม ×35 cap 60 ตามเป้าไวไม่ทัน)
--- - Catch-Up Boost: ยิ่งคลาดเป้ามาก ยิ่งเร่งตาม (err→0 แล้ว boost จาง = ไม่สั่นตอนล็อก)
--- - Lag Comp: เล็งนำหน้าด้วย targetVel × (1/lerpSpeed) ชดเชย lag ของ smoothing ตัวเอง
--- - [v2.1] Adaptive accel smoothing / slew rate แบบ วิ./วิ. / velocity จาก HRP
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3 — ANTI-PHANTOM-KICK PASS)
+-- PART 1: Core Setup, Cleanup, State, Weapon & Visibility Service
 -- =====================================================================
 
 local Players = game:GetService("Players")
@@ -13,7 +10,7 @@ local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
-local FALLBACK_SPEED = 3000 -- [BUG 9 FIX] ค่า fallback เดียวทั้งไฟล์
+local FALLBACK_SPEED = 3000
 
 -- ==========================================
 -- 1. CLEANUP MANAGER (Complete Lifecycle)
@@ -73,10 +70,10 @@ local State = {
         TeamCheck = true,
         WallCheck = false,
         Prediction = true,
-        PredReactivity = 1.0, -- [v2.1] คูณความไวของ adaptive smoothing (0.2 = อืด, 3.0 = ไวมาก)
-        PredMaxSlew = 3.0,    -- [v2.1] เพดานเปลี่ยน intercept time (วินาทีต่อวินาที)
-        TrackBoost = 1.5,     -- [v2.2] แรงเร่งตามเมื่อคลาดเป้า (0 = ปิด, 3 = วิ่งสุดตัว)
-        LagComp = true,       -- [v2.2] ชดเชย lag ของ smoothing ด้วยการเล็งนำหน้าตามความเร็วเป้า
+        PredReactivity = 1.5,
+        PredMaxSlew = 3.0,
+        TrackBoost = 1.5,
+        LagComp = true,
         TargetPartMode = "Head",
         PingCompensation = false,
         DropIsMultiplier = false,
@@ -166,13 +163,11 @@ function WeaponService:UpdateAuto()
                 end
         end
 
-        WeaponCache[tool] = { Speed = speed, Gravity = gravity }
+    WeaponCache[tool] = { Speed = speed, Gravity = gravity }
         self.Speed = speed
         self.Gravity = gravity
 end
 
--- [BUG 2 FIX] hook config-watcher ครั้งเดียวต่อ Tool ผ่าน weak set
--- เดิม: ทุกครั้งที่ re-equip ปืนเดิม จะ connect ChildAdded ใหม่ทับกองจน connection รั่ว
 local HookedTools = setmetatable({}, { __mode = "k" })
 local CONFIG_HINTS = { "acs_settings", "settings", "config" }
 
@@ -184,7 +179,6 @@ local function hookToolConfigWatcher(tool)
                 for _, hint in ipairs(CONFIG_HINTS) do
                         if childName:find(hint) then
                                 WeaponCache[tool] = nil
-                                -- [BUG 9 FIX เดิมคงไว้] guard ว่า Tool ยังถูกถืออยู่จริงก่อนอัปเดต
                                 local char = LocalPlayer and LocalPlayer.Character
                                 if char and char:FindFirstChildOfClass("Tool") == tool then
                                         WeaponService:UpdateAuto()
@@ -221,9 +215,6 @@ end
 -- 5. VISIBILITY SERVICE (Reuse RaycastParams)
 -- ==========================================
 local VisibilityService = {}
-
--- [PERF] ใช้ RaycastParams ตัวเดียวทั้งสคริปต์ + scratch table
--- เดิม: RaycastParams.new() ทุกครั้งที่เช็ค visibility = garbage ทุกเฟรม
 local RayParams = RaycastParams.new()
 RayParams.FilterType = Enum.RaycastFilterType.Exclude
 RayParams.IgnoreWater = true
@@ -245,7 +236,6 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
         local targetPos = targetPart.Position
         local direction = targetPos - origin
 
-        -- [BUG 6 FIX] origin ชน target เกือบเป๊ะ = มองเห็นอยู่แล้ว (เดิม .Unit แตก NaN)
         if direction.Magnitude < 0.05 then return true end
 
         local maxPierces = pierceCount or 1
@@ -284,10 +274,6 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
         return false
 end
 
--- ==========================================
--- 5.1 ENEMY VALIDITY (Component Cache)
--- ==========================================
--- [PERF] แคช Humanoid/RootPart ต่อ player — จบการ FindFirstChild ทุกเฟรม
 local PlayerCache = setmetatable({}, { __mode = "k" })
 
 local function getComponents(player)
@@ -307,7 +293,6 @@ local function getComponents(player)
                 PlayerCache[player] = entry
         end
 
-        -- Humanoid บางทีโผล่ช้ากว่า character 1 เฟรม — เติมเมื่อขาด
         if not entry.Humanoid then
                 entry.Humanoid = char:FindFirstChildOfClass("Humanoid")
         end
@@ -333,6 +318,10 @@ end
 CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(function(player)
         PlayerCache[player] = nil
 end))
+-- =====================================================================
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3)
+-- PART 2: Target Service, Prediction Engine & ESP Service
+-- =====================================================================
 
 -- ==========================================
 -- 6. TARGET SERVICE (State Machine)
@@ -343,7 +332,6 @@ local TargetService = {
         LockedPartName = nil
 }
 
--- [PERF] ย้าย table ออกจาก hot path (เดิม alloc ใหม่ทุกครั้งที่เรียก)
 local RANDOM_PARTS = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" }
 
 function TargetService:GetTargetPart(char)
@@ -360,7 +348,7 @@ function TargetService:GetTargetPart(char)
                 self.LockedPartName = name
                 return char:FindFirstChild(name) or root
         end
-        return root -- "Torso" → HumanoidRootPart
+        return root
 end
 
 function TargetService:ReleaseTarget()
@@ -399,8 +387,6 @@ function TargetService:AcquireTarget(camera, screenCenter, scaledFOV)
                 if isValidEnemy(player) then
                         local part = self:GetTargetPart(player.Character)
                         if part then
-                                -- [PERF] เช็คจอ+ระยะก่อน (ถูก) แล้วค่อย raycast (แพง) เป็นอันดับสุดท้าย
-                                -- เดิม: raycast ก่อน ทั้งที่เป้าอาจอยู่นอก FOV เสียเปล่า
                                 local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
                                 if onScreen and screenPoint.Z > 0 then
                                         local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
@@ -418,7 +404,6 @@ function TargetService:AcquireTarget(camera, screenCenter, scaledFOV)
         end
 
         if closestPlayer then
-                -- [BUG 4 FIX เดิมคงไว้] เปลี่ยนเป้าใหม่ = เคลียร์ Random-mode lock
                 if closestPlayer ~= self.CurrentTarget then
                         self.LockedPartName = nil
                 end
@@ -434,6 +419,18 @@ local TargetStates = {}
 local MAX_SAMPLE_DT = 0.1
 local MAX_PREDICTION_TIME = 5.0
 
+local MAX_DV_PER_SAMPLE = 35
+local SPIKE_COOLDOWN = 0.15
+local MAX_ACCEL = 200
+local ACCEL_TAU_BASE = 0.10
+local MAX_ACCEL_LEAD = 12
+
+local function clampAccelLead(v3)
+        local m = v3.Magnitude
+        if m > MAX_ACCEL_LEAD then return v3 * (MAX_ACCEL_LEAD / m) end
+        return v3
+end
+
 task.spawn(function()
         while getgenv().SnyX_Running and task.wait(10) do
                 for part in pairs(TargetStates) do
@@ -445,8 +442,6 @@ task.spawn(function()
 end)
 CleanupManager:AddCustomCleanup(function() table.clear(TargetStates) end)
 
--- [v2.1] เลือก HumanoidRootPart เป็นแหล่งความเร็ว — Head แกว่งตาม animation = noise ในสมการ
--- ยังเล็งตำแหน่งของ part จริง (Head) เหมือนเดิม แค่จับ velocity/accel จากราก
 local function getKinematicPart(targetPart)
         local parent = targetPart.Parent
         if parent then
@@ -456,9 +451,6 @@ local function getKinematicPart(targetPart)
         return targetPart
 end
 
--- [v2.1] Adaptive smoothing: activity = EMA ของ |accel ดิบ|
--- - เดินสบาย ๆ: activity ~2-10 → alpha ~0.15 (นิ่ง ไม่สั่น)
--- - หักศอก/พุ่ง: activity ~100+ → alpha ปัดเพดาน 0.85 (ตามทันที)
 local function getTargetAcceleration(kinPart, targetVel, currentTime)
         local state = TargetStates[kinPart]
 
@@ -467,8 +459,8 @@ local function getTargetAcceleration(kinPart, targetVel, currentTime)
                         lastVelocity = targetVel,
                         lastTime = currentTime,
                         smoothedAcceleration = Vector3.zero,
-                        lastPredictionTime = nil, -- [v2.1] nil = ยังไม่มีค่าเก่า → slew จะไม่คุม 2 เฟรมแรก
-                        activity = 0,
+                        lastPredictionTime = nil,
+                        spikeUntil = 0,
                         samples = 1
                 }
                 return Vector3.zero
@@ -486,7 +478,8 @@ local function getTargetAcceleration(kinPart, targetVel, currentTime)
                 state.lastVelocity = targetVel
                 state.lastTime = currentTime
                 state.smoothedAcceleration = Vector3.zero
-                state.lastPredictionTime = nil -- [v2.1] ค่าเก่าหมดอายุแล้ว ห้ามใช้คุม slew
+                state.lastPredictionTime = nil
+                state.spikeUntil = 0
                 return Vector3.zero
         end
 
@@ -494,15 +487,28 @@ local function getTargetAcceleration(kinPart, targetVel, currentTime)
         state.lastTime = currentTime
         state.samples += 1
 
-        local rawAcceleration = (targetVel - previousVelocity) / dt
+        if currentTime < state.spikeUntil then
+                state.smoothedAcceleration = Vector3.zero
+                return Vector3.zero
+        end
 
-        -- activity ไต่ช้า (EMA 0.1) เพื่อให้ alpha ตัวเองนิ่ง ไม่กระโดดทุกเฟรม
-        state.activity += (rawAcceleration.Magnitude - state.activity) * 0.1
+        local dv = targetVel - previousVelocity
 
-        -- alpha = 0.15 ฐาน + สเกลตาม activity, คูณ slider Reactivity
-        local reactivity = State.PredReactivity or 1.0
-        local alpha = math.clamp(0.15 + (state.activity / 60) * 0.5 * reactivity, 0.05, 0.85)
+        if dv.Magnitude > MAX_DV_PER_SAMPLE then
+                state.spikeUntil = currentTime + SPIKE_COOLDOWN
+                state.smoothedAcceleration = Vector3.zero
+                return Vector3.zero
+        end
+
+        local rawAcceleration = dv / dt
+        local tau = ACCEL_TAU_BASE / math.clamp(State.PredReactivity or 1.0, 0.2, 3)
+        local alpha = 1 - math.exp(-dt / tau)
         state.smoothedAcceleration = state.smoothedAcceleration:Lerp(rawAcceleration, alpha)
+
+        local accelMag = state.smoothedAcceleration.Magnitude
+        if accelMag > MAX_ACCEL then
+                state.smoothedAcceleration = state.smoothedAcceleration * (MAX_ACCEL / accelMag)
+        end
         return state.smoothedAcceleration
 end
 
@@ -512,11 +518,10 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
         if typeof(bulletGravityVec) ~= "Vector3" then return nil end
         if not targetPart or not targetPart:IsA("BasePart") then return nil end
 
-        local dt = deltaTime or (1 / 60) -- [v2.1] slew ใช้ dt จริง เพื่อให้ความหมายเดียวกันทุก frame rate
+        local dt = deltaTime or (1 / 60)
         local currentTime = os.clock()
         local targetPos = targetPart.Position
 
-        -- [v2.1] kinematic part = รากของตัวละคร (HRP) — velocity สะอาดกว่า Head
         local kinPart = getKinematicPart(targetPart)
         local targetVel = kinPart.AssemblyLinearVelocity
         local pingOffset = State.PingCompensation and (getPing() * 0.5) or 0
@@ -524,7 +529,7 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
 
         local function f(t)
                 local totalT = t + pingOffset
-                local targetAtT = targetPos + (targetVel * totalT) + (0.5 * targetAcc * (totalT ^ 2))
+                local targetAtT = targetPos + (targetVel * totalT) + clampAccelLead(0.5 * targetAcc * (totalT ^ 2))
                 local bulletDropAtT = 0.5 * bulletGravityVec * (t ^ 2)
                 local requiredDisplacement = targetAtT - shooterPos - bulletDropAtT
                 return (bulletSpeed * t) - requiredDisplacement.Magnitude
@@ -555,9 +560,6 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
                 f1 = f(t1)
         end
 
-        -- [v2.1] slew แบบ rate-based: เพดาน = PredMaxSlew (วิ./วิ.) × dt
-        -- - เดิม 0.02/เฟรม: 60Hz = 1.2 วิ./วิ. แต่ 144Hz = 2.88 วิ./วิ. (คนละพฤติกรรมบนเครื่องละเครื่อง)
-        -- - lastPredictionTime = nil (เป้าใหม่/hitch) → ข้าม slew เฟรมนั้น ดอกแรกล็อกทันที ไม่ไต่
         local state = TargetStates[kinPart]
         if state then
                 local prevPredictionTime = state.lastPredictionTime
@@ -570,7 +572,7 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
         end
 
         local finalT = t_intercept + pingOffset
-        local finalTargetPos = targetPos + (targetVel * finalT) + (0.5 * targetAcc * (finalT ^ 2))
+        local finalTargetPos = targetPos + (targetVel * finalT) + clampAccelLead(0.5 * targetAcc * (finalT ^ 2))
         local displacement = finalTargetPos - shooterPos
 
         if t_intercept > 0 then
@@ -582,14 +584,12 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
         return safeUnit(displacement)
 end
 
--- [BUG 10 FIX] ตัดพารามิเตอร์ rootPart ที่ไม่เคยถูกใช้ทิ้ง
 local lastGravVal, lastGravVec = nil, nil
 
 local function getPredictedPosition(targetPart, shooterPos, deltaTime)
         local targetPos = targetPart.Position
         if not State.Prediction then return targetPos end
 
-        -- [PERF] cache Vector3 ของแรงโน้มถ่วง สร้างใหม่เฉพาะเมื่อค่าเปลี่ยน
         if lastGravVal ~= WeaponService.Gravity then
                 lastGravVal = WeaponService.Gravity
                 lastGravVec = Vector3.new(0, -lastGravVal, 0)
@@ -606,7 +606,7 @@ end
 -- 8. ESP SERVICE (Throttle 30Hz, Ref-Cached)
 -- ==========================================
 local ESPService = {
-        Cache = {}, -- [player] = { Character, Visible, LastCheck, Highlight, NameTag, ShownVisible }
+        Cache = {},
         COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
         COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50),
         OUTLINE_VISIBLE = Color3.fromRGB(255, 215, 0),
@@ -638,7 +638,7 @@ local function buildNameTag(char, head, text)
         nameTag.Size = UDim2.new(0, 150, 0, 30)
         nameTag.StudsOffset = Vector3.new(0, 2, 0)
         nameTag.AlwaysOnTop = true
-        nameTag.MaxDistance = 1500 -- [PERF] ไกลเกินนี้ไม่ render tag
+        nameTag.MaxDistance = 1500
 
         local textLabel = Instance.new("TextLabel")
         textLabel.Name = "TagLabel"
@@ -664,8 +664,6 @@ function ESPService:ProcessESP()
                 if player ~= LocalPlayer then
                         local char = player.Character
 
-                        -- [BUG 4 FIX] ไม่มี character = เคลียร์ cache ทิ้ง
-                        -- เดิม: entry ค้างถือ reference ของ character ที่ถูก destroy ตลอดไป
                         if not char then
                                 self.Cache[player] = nil
                         else
@@ -685,7 +683,6 @@ function ESPService:ProcessESP()
                                 local isEnemy = isValidEnemy(player)
 
                                 if not isEnemy or (not State.ESP and not State.ESPName) then
-                                        -- [PERF] ใช้ ref จาก cache แทน FindFirstChild ทุก tick
                                         if entry.Highlight then entry.Highlight:Destroy(); entry.Highlight = nil end
                                         if entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil end
                                         entry.ShownVisible = nil
@@ -695,8 +692,6 @@ function ESPService:ProcessESP()
                                                 entry.LastCheck = now
                                         end
 
-                                        -- [BUG 8 FIX] เขียน property เฉพาะเมื่อสีจะเปลี่ยนจริง
-                                        -- เดิม: set สีใหม่ 30 ครั้ง/วินาที ทั้งที่ค่าเดิม = dirty flag ใส่ renderer ฟรี
                                         if State.ESP then
                                                 local hl = entry.Highlight
                                                 if not hl or hl.Parent ~= char then
@@ -745,7 +740,6 @@ function ESPService:ProcessESP()
         end
 end
 
--- 30Hz throttle คงเดิม (Heartbeat + accumulator)
 local espAccumulator = 0
 local ESP_INTERVAL = 1 / 30
 CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt)
@@ -756,6 +750,10 @@ CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt
                 ESPService:ProcessESP()
         end
 end))
+-- =====================================================================
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.3)
+-- PART 3: Main Camera Engine & UI Construction
+-- =====================================================================
 
 -- ==========================================
 -- 9. MAIN CAMERA ENGINE
@@ -779,12 +777,10 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
         local camera = getCamera()
         if not camera then return end
 
-        -- [PERF] คำนวณ scaled FOV ครั้งเดียวต่อเฟรม (เดิมคิดซ้ำ 3 จุด)
         local vp = camera.ViewportSize
         local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
         local scaledFOV = State.FOV * (vp.Y / 1080)
 
-        -- [BUG 11 FIX] อัปเดตวง FOV เฉพาะตอนแสดงผล
         if State.ShowFOV then
                 FOVCircle.Position = screenCenter
                 FOVCircle.Radius = scaledFOV
@@ -804,7 +800,6 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                 end
         end
 
-        -- [PERF] acquire สแกน 30Hz (keep target ยังล็อกทุกเฟรม — การเล็งไม่กระตุก)
         if not TargetService.CurrentTarget then
                 frameTick += 1
                 if frameTick % 2 == 0 then
@@ -817,13 +812,8 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                 local shooterPos = camera.CFrame.Position
                 local targetPos = getPredictedPosition(targetPart, shooterPos, deltaTime)
 
-                -- [v2.2] Remap ความเร็วตาม: เดิม Smoothness*35 cap 60 คือ first-order lag หนัก
-                -- (lag คงที่ = ωเป้า / k → เป้ายิ่งเร็ว จุดเล็งยิ่งตกหลังเท่าเดิมตลอดเวลา)
-                -- ×120 cap 300: Smoothness 0.8 → k=96 (เดิม 28), 1.0 → k=120
                 local baseSpeed = math.clamp(State.Smoothness * 120, 6, 300)
 
-                -- [v2.2] Lag Comp: smoothing ทำให้กล้องตาม desiredDirection ช้าไป τ = 1/k วินาที
-                -- → เล็งนำหน้าด้วย targetVel × τ เพื่อหัก lag ตัวเองออกใน steady state (open-loop จึงไม่ overshoot)
                 if State.LagComp then
                         local tau = math.min(1 / baseSpeed, 0.15)
                         local kinPart = getKinematicPart(targetPart)
@@ -833,11 +823,8 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                         end
                 end
 
-                -- [BUG 6 FIX ฝั่งนี้ด้วย] กัน .Unit บนเวกเตอร์ยาว 0
                 local desiredDirection = safeUnit(targetPos - shooterPos)
                 if desiredDirection then
-                        -- [v2.2] Catch-Up Boost: มุมคลาดมาก → คูณความเร็วตาม, คลาดน้อย → กลับเป็น smooth ปกติ
-                        -- เป้าหักศอกแล้วจุดเล็งวิ่งตามทันที แต่พอใกล้เป้าแล้ว boost จางลง (ไม่แกว่งรอบศีรษะ)
                         local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
                         local errDeg = math.deg(math.acos(dot))
                         local boostC = State.TrackBoost or 1.5
@@ -898,8 +885,6 @@ local mainStroke = Instance.new("UIStroke")
 mainStroke.Color = Color3.fromRGB(45, 45, 45)
 mainStroke.Parent = MainFrame
 
--- [BUG 7 FIX] เลิกใช้ Draggable (deprecated + hijack input ทั้งเฟรม)
--- → manual drag เฉพาะ handle ที่กำหนด กด slider/toggle แล้วหน้าต่างไม่ขยับ
 local dragConnIndex = 0
 local function enableDrag(handle, target)
         local dragging = false
@@ -912,14 +897,6 @@ local function enableDrag(handle, target)
                         dragging = true
                         dragStart = input.Position
                         startPos = target.Position
-                end
-        end))
-
-        dragConnIndex += 1
-        CleanupManager:AddConn("DragEnded" .. dragConnIndex, handle.InputEnded:Connect(function(input)
-                if input.UserInputType == Enum.UserInputType.MouseButton1
-                        or input.UserInputType == Enum.UserInputType.Touch then
-                        dragging = false
                 end
         end))
 
@@ -962,7 +939,6 @@ ToggleBtn.MouseButton1Click:Connect(function()
         MainFrame.Visible = not MainFrame.Visible
 end)
 
--- ลากปุ่ม SnyX ด้วยตัวปุ่ม / ลากหน้าต่างเฉพาะที่ TitleBar
 enableDrag(ToggleBtn, ToggleBtn)
 enableDrag(TitleBar, MainFrame)
 
@@ -1138,8 +1114,6 @@ local function createSlider(text, min, max, default, step, callback)
                         or input.UserInputType == Enum.UserInputType.Touch then
                         dragging = true
 
-                        -- [BUG 1 FIX] snap แล้วเก็บ float noise ทิ้ง
-                        -- เดิม: math.floor(x/step+0.5)*step ได้ 0.35000000000000003 โชว์บน label
                         local function update(inp)
                                 local ratio = math.clamp(
                                         (inp.Position.X - sliderBar.AbsolutePosition.X)
@@ -1205,7 +1179,6 @@ end)
 createSlider("Smoothness", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
 createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
 
--- [v2.1] Prediction tuning — ปรับสดระหว่างเกมได้
 createSlider("Pred Reactivity", 0.2, 3, State.PredReactivity, 0.05, function(v)
         State.PredReactivity = v
 end)
@@ -1213,7 +1186,6 @@ createSlider("Pred Max Slew (s/s)", 0.5, 10, State.PredMaxSlew, 0.5, function(v)
         State.PredMaxSlew = v
 end)
 
--- [v2.2] Tracking speed tuning — แก้อาการจุดเล็งตามช้า
 createToggle("Lag Comp", State.LagComp, function(v) State.LagComp = v end)
 createSlider("Catch-Up Boost", 0, 3, State.TrackBoost, 0.05, function(v)
         State.TrackBoost = v
