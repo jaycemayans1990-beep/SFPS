@@ -1,7 +1,7 @@
--- Luau | snyx_aimbot_v2_4.lua | Roblox executor (Synapse-style env)
+-- Luau | snyx_aimbot_v2_5.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4 — ZOOM-AWARE PASS)
--- PART 1: Core Setup, Cleanup, State, Weapon & Visibility Service
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5 — SNAP + DRAG-SWITCH PASS)
+-- PART 1: Core Setup, Cleanup, State, Zoom Scale, Weapon & Visibility Service
 -- =====================================================================
 
 local Players = game:GetService("Players")
@@ -74,6 +74,8 @@ local State = {
         PredMaxSlew = 3.0,
         TrackBoost = 1.5,
         LagComp = true,
+        SnapAngle = 20,
+        DragSwitch = true,
         TargetPartMode = "Head",
         PingCompensation = false,
         DropIsMultiplier = false,
@@ -328,7 +330,7 @@ CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(fu
         PlayerCache[player] = nil
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5)
 -- PART 2: Target Service, Prediction Engine & ESP Service
 -- =====================================================================
 
@@ -771,7 +773,7 @@ CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt
         end
 end))
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.4)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.5)
 -- PART 3: Main Camera Engine & UI Construction
 -- =====================================================================
 
@@ -790,6 +792,23 @@ local function hasActiveWeapon()
         local character = LocalPlayer and LocalPlayer.Character
         return character ~= nil and character:FindFirstChildOfClass("Tool") ~= nil
 end
+
+local flickUntil = 0
+CleanupManager:AddConn("FlickDetect", UserInputService.InputChanged:Connect(function(input)
+        if not State.DragSwitch then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                local d = input.Delta
+                if d then
+                        local camera = getCamera()
+                        local vpX = camera and camera.ViewportSize.X or 1920
+                        local thresh = math.max(18, vpX * 0.012)
+                        if (math.abs(d.X) + math.abs(d.Y)) > thresh then
+                                flickUntil = os.clock() + 0.18
+                        end
+                end
+        end
+end))
 
 local frameTick = 0
 
@@ -810,6 +829,11 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
         end
 
         if not State.Aimbot or not hasActiveWeapon() then
+                if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
+                return
+        end
+
+        if State.DragSwitch and os.clock() < flickUntil then
                 if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
                 return
         end
@@ -841,11 +865,17 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                 if desiredDirection then
                         local dot = math.clamp(camera.CFrame.LookVector:Dot(desiredDirection), -1, 1)
                         local errDeg = math.deg(math.acos(dot))
-                        local boostC = State.TrackBoost or 1.5
-                        local boost = 1 + math.min(errDeg * zoomScale / 10, 2) * boostC
-                        local effSpeed = math.min(baseSpeed * boost, 480)
+                        local snapAngle = State.SnapAngle or 20
+                        local alpha
+                        if snapAngle > 0 and errDeg * zoomScale >= snapAngle then
+                                alpha = 1
+                        else
+                                local boostC = State.TrackBoost or 1.5
+                                local boost = 1 + math.min(errDeg * zoomScale / 10, 2) * boostC
+                                local effSpeed = math.min(baseSpeed * boost, 480)
+                                alpha = 1 - math.exp(-effSpeed * deltaTime)
+                        end
 
-                        local alpha = 1 - math.exp(-effSpeed * deltaTime)
                         local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha))
                         if smoothDirection then
                                 camera.CFrame = CFrame.lookAt(shooterPos, shooterPos + smoothDirection)
@@ -1204,3 +1234,8 @@ createToggle("Lag Comp", State.LagComp, function(v) State.LagComp = v end)
 createSlider("Catch-Up Boost", 0, 3, State.TrackBoost, 0.05, function(v)
         State.TrackBoost = v
 end)
+
+createSlider("Snap Angle", 0, 60, State.SnapAngle, 1, function(v)
+        State.SnapAngle = v
+end)
+createToggle("Drag To Switch", State.DragSwitch, function(v) State.DragSwitch = v end)
