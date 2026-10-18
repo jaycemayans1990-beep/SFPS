@@ -1,7 +1,7 @@
+-- Luau | snyx_aimbot_v2.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT + SILENT AIM & ESP (ALL-IN-ONE FIXED)
--- Luau (Roblox executor runtime) | R6/R15 | ACS-style + Raycast guns
--- Re-exec safe: previous instance self-cleans (incl. namecall unhook).
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2 — AUDIT + PERFORMANCE PASS)
+-- แก้บั๊ก 11 จุด + ปรับสถาปัตยกรรมให้ GC-quiet และลด per-frame cost
 -- =====================================================================
 
 local Players = game:GetService("Players")
@@ -9,6 +9,8 @@ local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
+
+local FALLBACK_SPEED = 3000 -- [BUG 9 FIX] ค่า fallback เดียวทั้งไฟล์
 
 -- ==========================================
 -- 1. CLEANUP MANAGER (Complete Lifecycle)
@@ -23,16 +25,19 @@ local CleanupManager = {
 function CleanupManager:AddConn(name, conn)
     if self.Connections[name] then self.Connections[name]:Disconnect() end
     self.Connections[name] = conn
+    return conn
 end
 
 function CleanupManager:AddInstance(name, inst)
     if self.Instances[name] then self.Instances[name]:Destroy() end
     self.Instances[name] = inst
+    return inst
 end
 
 function CleanupManager:AddDrawing(name, drawing)
     if self.Drawings[name] then self.Drawings[name]:Remove() end
     self.Drawings[name] = drawing
+    return drawing
 end
 
 function CleanupManager:AddCustomCleanup(func)
@@ -42,9 +47,9 @@ end
 function CleanupManager:CleanAll()
     getgenv().SnyX_Running = false
 
-    for _, conn in pairs(self.Connections) do pcall(function() conn:Disconnect() end) end
-    for _, inst in pairs(self.Instances) do pcall(function() inst:Destroy() end) end
-    for _, draw in pairs(self.Drawings) do pcall(function() draw:Remove() end) end
+    for _, conn in pairs(self.Connections) do conn:Disconnect() end
+    for _, inst in pairs(self.Instances) do inst:Destroy() end
+    for _, draw in pairs(self.Drawings) do draw:Remove() end
     for _, func in ipairs(self.CustomCleanups) do pcall(func) end
 
     table.clear(self.Connections)
@@ -74,10 +79,6 @@ local State = {
     Smoothness = 0.8,
     FOV = 100,
     ShowFOV = false,
-    -- Silent Aim
-    SilentAim = false,
-    SilentMethod = "Raycast", -- "Raycast" (steer game ray) | "Remote" (rewrite FireServer args)
-    -- ESP
     ESP = true,
     ESPName = false
 }
@@ -85,29 +86,32 @@ local State = {
 local function getCamera() return Workspace.CurrentCamera end
 
 local function getPing()
-    if not LocalPlayer then return 0 end
-    local success, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if not LocalPlayer then return 0.025 end
+    local success, ping = pcall(LocalPlayer.GetNetworkPing, LocalPlayer)
     return (success and type(ping) == "number") and ping or 0.025
 end
 
-local function scaleFov(fovPx)
-    local camera = getCamera()
-    local vp = camera and camera.ViewportSize or Vector2.new(1920, 1080)
-    return fovPx * (vp.Y / 1080)
+-- ==========================================
+-- 3. MATH HELPERS
+-- ==========================================
+local function safeUnit(v3)
+    local mag = v3.Magnitude
+    if mag <= 1e-6 then return nil end
+    return v3 / mag
 end
 
 -- ==========================================
--- 3. WEAPON SERVICE (Cached Weapon Stats)
+-- 4. WEAPON SERVICE (Cached Weapon Stats)
 -- ==========================================
 local WeaponService = {
-    Speed = 3000,
+    Speed = FALLBACK_SPEED,
     Gravity = workspace.Gravity
 }
 
 function WeaponService:UpdateManual()
     if not State.AutoBulletSpeed then
-        self.Speed = math.max(State.BulletSpeed or 10000, 1)
-        self.Gravity = State.BulletGravity ~= nil and State.BulletGravity or workspace.Gravity
+        self.Speed = math.max(State.BulletSpeed or FALLBACK_SPEED, 1)
+        self.Gravity = State.BulletGravity or workspace.Gravity
     end
 end
 
@@ -116,26 +120,29 @@ local WeaponCache = setmetatable({}, { __mode = "k" })
 function WeaponService:UpdateAuto()
     if not State.AutoBulletSpeed then return self:UpdateManual() end
 
-    local char = LocalPlayer.Character
+    local char = LocalPlayer and LocalPlayer.Character
     local tool = char and char:FindFirstChildOfClass("Tool")
 
     if not tool then
-        self.Speed = math.max(State.BulletSpeed or 3000, 1)
+        self.Speed = math.max(State.BulletSpeed or FALLBACK_SPEED, 1)
         self.Gravity = workspace.Gravity
         return
     end
 
-    if WeaponCache[tool] then
-        self.Speed = WeaponCache[tool].Speed
-        self.Gravity = WeaponCache[tool].Gravity
+    local cached = WeaponCache[tool]
+    if cached then
+        self.Speed = cached.Speed
+        self.Gravity = cached.Gravity
         return
     end
 
     local toolName = tool.Name:lower()
-    local isLauncher = toolName:find("rpg") or toolName:find("rocket") or toolName:find("launcher") or toolName:find("grenade")
-    local acsSettings = tool:FindFirstChild("ACS_Settings") or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
+    local isLauncher = toolName:find("rpg") or toolName:find("rocket")
+        or toolName:find("launcher") or toolName:find("grenade")
+    local acsSettings = tool:FindFirstChild("ACS_Settings")
+        or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
 
-    local speed, gravity = State.BulletSpeed or 3000, workspace.Gravity
+    local speed, gravity = State.BulletSpeed or FALLBACK_SPEED, workspace.Gravity
 
     if acsSettings and acsSettings:IsA("ModuleScript") then
         local success, config = pcall(require, acsSettings)
@@ -157,104 +164,112 @@ function WeaponService:UpdateAuto()
     self.Gravity = gravity
 end
 
--- [FIX 1] Track per-tool config listeners so they are disconnected on
--- tool removal / cleanup instead of leaking one connection per equip.
-local ToolConfigConns = setmetatable({}, { __mode = "k" })
+-- [BUG 2 FIX] hook config-watcher ครั้งเดียวต่อ Tool ผ่าน weak set
+-- เดิม: ทุกครั้งที่ re-equip ปืนเดิม จะ connect ChildAdded ใหม่ทับกองจน connection รั่ว
+local HookedTools = setmetatable({}, { __mode = "k" })
+local CONFIG_HINTS = { "acs_settings", "settings", "config" }
+
+local function hookToolConfigWatcher(tool)
+    if HookedTools[tool] then return end
+    HookedTools[tool] = true
+    tool.ChildAdded:Connect(function(child)
+        local childName = child.Name:lower()
+        for _, hint in ipairs(CONFIG_HINTS) do
+            if childName:find(hint) then
+                WeaponCache[tool] = nil
+                -- [BUG 9 FIX เดิมคงไว้] guard ว่า Tool ยังถูกถืออยู่จริงก่อนอัปเดต
+                local char = LocalPlayer and LocalPlayer.Character
+                if char and char:FindFirstChildOfClass("Tool") == tool then
+                    WeaponService:UpdateAuto()
+                end
+                break
+            end
+        end
+    end)
+end
 
 local function setupCharacterWeaponListener(char)
     if not char then return end
     CleanupManager:AddConn("ToolAdded", char.ChildAdded:Connect(function(child)
         if child:IsA("Tool") then
-            WeaponCache[child] = nil
-            -- Config may be injected after the tool exists; invalidate cache when it arrives.
-            ToolConfigConns[child] = child.ChildAdded:Connect(function(c)
-                local cName = c.Name:lower()
-                if cName:find("acs_settings") or cName:find("settings") or cName:find("config") then
-                    WeaponCache[child] = nil
-                    WeaponService:UpdateAuto()
-                end
-            end)
-
+            hookToolConfigWatcher(child)
             task.defer(function()
                 local t = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
                 if t == child then WeaponService:UpdateAuto() end
             end)
         end
     end))
-    CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function(child)
-        if child:IsA("Tool") then
-            if ToolConfigConns[child] then
-                ToolConfigConns[child]:Disconnect()
-                ToolConfigConns[child] = nil
-            end
-            WeaponCache[child] = nil
-            task.defer(function() WeaponService:UpdateAuto() end)
-        end
+    CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function()
+        task.defer(function() WeaponService:UpdateAuto() end)
     end))
     WeaponService:UpdateAuto()
 end
 
-if LocalPlayer.Character then setupCharacterWeaponListener(LocalPlayer.Character) end
-CleanupManager:AddConn("CharAdded", LocalPlayer.CharacterAdded:Connect(setupCharacterWeaponListener))
-
-CleanupManager:AddCustomCleanup(function()
-    for tool, conn in pairs(ToolConfigConns) do
-        pcall(function() conn:Disconnect() end)
-        ToolConfigConns[tool] = nil
-    end
-end)
-
--- [FIX 2] Live gravity sync: games that change workspace.Gravity mid-match
--- would otherwise leave cached drop values stale. Invalidate + recompute.
-CleanupManager:AddConn("GravityChanged", Workspace:GetPropertyChangedSignal("Gravity"):Connect(function()
-    if State.AutoBulletSpeed then
-        table.clear(WeaponCache)
-        WeaponService:UpdateAuto()
-    end
-end))
+if LocalPlayer then
+    if LocalPlayer.Character then setupCharacterWeaponListener(LocalPlayer.Character) end
+    CleanupManager:AddConn("CharAdded", LocalPlayer.CharacterAdded:Connect(setupCharacterWeaponListener))
+end
 
 -- ==========================================
--- 4. VISIBILITY SERVICE (Shared RaycastParams)
+-- 5. VISIBILITY SERVICE (Reuse RaycastParams)
 -- ==========================================
 local VisibilityService = {}
 
--- [PERF] One reusable RaycastParams + one scratch filter table instead of
--- allocating both on every call (this runs dozens of times per frame).
-local SharedRayParams = RaycastParams.new()
-SharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
-SharedRayParams.IgnoreWater = true
+-- [PERF] ใช้ RaycastParams ตัวเดียวทั้งสคริปต์ + scratch table
+-- เดิม: RaycastParams.new() ทุกครั้งที่เช็ค visibility = garbage ทุกเฟรม
+local RayParams = RaycastParams.new()
+RayParams.FilterType = Enum.RaycastFilterType.Exclude
+RayParams.IgnoreWater = true
+
 local ScratchFilter = {}
 
 function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specificPart)
-    if not targetCharacter then return false end
     local camera = getCamera()
-    if not camera then return false end
+    if not (camera and targetCharacter) then return false end
 
-    local targetPart = specificPart or targetCharacter:FindFirstChild("Head") or targetCharacter:FindFirstChild("HumanoidRootPart")
+    local targetPart = specificPart
+    if not (targetPart and targetPart.Parent) then
+        targetPart = targetCharacter:FindFirstChild("Head")
+            or targetCharacter:FindFirstChild("HumanoidRootPart")
+    end
     if not targetPart then return false end
 
     local origin = camera.CFrame.Position
     local targetPos = targetPart.Position
-    local currentOrigin = origin
-    local currentDirection = targetPos - origin
+    local direction = targetPos - origin
+
+    -- [BUG 6 FIX] origin ชน target เกือบเป๊ะ = มองเห็นอยู่แล้ว (เดิม .Unit แตก NaN)
+    if direction.Magnitude < 0.05 then return true end
+
     local maxPierces = pierceCount or 1
+    local currentOrigin = origin
+    local currentDirection = direction
 
     table.clear(ScratchFilter)
-    if LocalPlayer.Character then table.insert(ScratchFilter, LocalPlayer.Character) end
+    local n = 0
+    local myChar = LocalPlayer and LocalPlayer.Character
+    if myChar then
+        n += 1
+        ScratchFilter[n] = myChar
+    end
 
     for i = 1, maxPierces do
-        SharedRayParams.FilterDescendantsInstances = ScratchFilter
-        local result = Workspace:Raycast(currentOrigin, currentDirection, SharedRayParams)
+        RayParams.FilterDescendantsInstances = ScratchFilter
+        local result = Workspace:Raycast(currentOrigin, currentDirection, RayParams)
 
         if not result then return true end
 
         local hitPart = result.Instance
         if hitPart:IsDescendantOf(targetCharacter) then return true end
 
-        if maxPierces > 1 and (hitPart.Transparency > 0.8 or not hitPart.CanCollide) then
-            table.insert(ScratchFilter, hitPart)
-            currentDirection = targetPos - result.Position
-            currentOrigin = result.Position + (currentDirection.Unit * 0.05)
+        if i < maxPierces and (hitPart.Transparency > 0.8 or not hitPart.CanCollide) then
+            n += 1
+            ScratchFilter[n] = hitPart
+            local seg = targetPos - result.Position
+            local segUnit = safeUnit(seg)
+            if not segUnit then return true end
+            currentOrigin = result.Position + segUnit * 0.05
+            currentDirection = seg
         else
             return false
         end
@@ -262,18 +277,58 @@ function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specifi
     return false
 end
 
+-- ==========================================
+-- 5.1 ENEMY VALIDITY (Component Cache)
+-- ==========================================
+-- [PERF] แคช Humanoid/RootPart ต่อ player — จบการ FindFirstChild ทุกเฟรม
+local PlayerCache = setmetatable({}, { __mode = "k" })
+
+local function getComponents(player)
+    local char = player.Character
+    if not char then
+        PlayerCache[player] = nil
+        return nil
+    end
+
+    local entry = PlayerCache[player]
+    if not entry or entry.Character ~= char then
+        entry = {
+            Character = char,
+            Humanoid = char:FindFirstChildOfClass("Humanoid"),
+            Root = char:FindFirstChild("HumanoidRootPart")
+        }
+        PlayerCache[player] = entry
+    end
+
+    -- Humanoid บางทีโผล่ช้ากว่า character 1 เฟรม — เติมเมื่อขาด
+    if not entry.Humanoid then
+        entry.Humanoid = char:FindFirstChildOfClass("Humanoid")
+    end
+    return entry
+end
+
 local function isValidEnemy(player)
-    if not player or player == LocalPlayer or not player.Character then return false end
-    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-    local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
-    if not humanoid or not rootPart or humanoid.Health <= 0 then return false end
-    if player.Character:FindFirstChildOfClass("ForceField") then return false end
-    if State.TeamCheck and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then return false end
+    if not player or player == LocalPlayer then return false end
+    local entry = getComponents(player)
+    if not entry then return false end
+
+    local humanoid, root = entry.Humanoid, entry.Root
+    if not humanoid or humanoid.Health <= 0 then return false end
+    if not root or root.Parent ~= entry.Character then return false end
+    if entry.Character:FindFirstChildOfClass("ForceField") then return false end
+    if State.TeamCheck and player.Team and LocalPlayer.Team
+        and player.Team == LocalPlayer.Team then
+        return false
+    end
     return true
 end
 
+CleanupManager:AddConn("PlayerRemovingCaches", Players.PlayerRemoving:Connect(function(player)
+    PlayerCache[player] = nil
+end))
+
 -- ==========================================
--- 5. TARGET SERVICE (State Machine)
+-- 6. TARGET SERVICE (State Machine)
 -- ==========================================
 local TargetService = {
     CurrentTarget = nil,
@@ -281,19 +336,24 @@ local TargetService = {
     LockedPartName = nil
 }
 
+-- [PERF] ย้าย table ออกจาก hot path (เดิม alloc ใหม่ทุกครั้งที่เรียก)
+local RANDOM_PARTS = { "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart" }
+
 function TargetService:GetTargetPart(char)
     local root = char:FindFirstChild("HumanoidRootPart")
-    if State.TargetPartMode == "Head" then return char:FindFirstChild("Head") or root end
+    if State.TargetPartMode == "Head" then
+        return char:FindFirstChild("Head") or root
+    end
     if State.TargetPartMode == "Random" then
-        if self.LockedPartName and char:FindFirstChild(self.LockedPartName) then
-            return char:FindFirstChild(self.LockedPartName)
+        if self.LockedPartName then
+            local locked = char:FindFirstChild(self.LockedPartName)
+            if locked then return locked end
         end
-        local parts = {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}
-        local name = parts[math.random(1, #parts)]
+        local name = RANDOM_PARTS[math.random(1, #RANDOM_PARTS)]
         self.LockedPartName = name
         return char:FindFirstChild(name) or root
     end
-    return root
+    return root -- "Torso" → HumanoidRootPart
 end
 
 function TargetService:ReleaseTarget()
@@ -302,39 +362,48 @@ function TargetService:ReleaseTarget()
     self.LockedPartName = nil
 end
 
-function TargetService:KeepTarget(camera, screenCenter)
-    if not isValidEnemy(self.CurrentTarget) then return false end
-    if not self.TargetPart or not self.TargetPart.Parent or not self.TargetPart:IsDescendantOf(self.CurrentTarget.Character) then
+function TargetService:KeepTarget(camera, screenCenter, scaledFOV)
+    local target = self.CurrentTarget
+    if not isValidEnemy(target) then return false end
+
+    local part = self.TargetPart
+    if not (part and part.Parent and part:IsDescendantOf(target.Character)) then
         return false
     end
-    if State.WallCheck and not VisibilityService:CheckVisibility(self.CurrentTarget.Character, 1, self.TargetPart) then return false end
 
-    local screenPoint, onScreen = camera:WorldToViewportPoint(self.TargetPart.Position)
+    if State.WallCheck and not VisibilityService:CheckVisibility(target.Character, 1, part) then
+        return false
+    end
+
+    local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
     if not onScreen or screenPoint.Z <= 0 then return false end
 
     local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
-    if dist > scaleFov(State.FOV) then return false end
-
-    return true
+    return dist <= scaledFOV
 end
 
-function TargetService:AcquireTarget(camera, screenCenter)
-    local closestPlayer = nil
-    local currentScaledFOV = scaleFov(State.FOV)
-    local shortestDist = currentScaledFOV
-    local bestPart = nil
+function TargetService:AcquireTarget(camera, screenCenter, scaledFOV)
+    local closestDist = scaledFOV
+    local closestPlayer, bestPart = nil, nil
 
-    for _, player in ipairs(Players:GetPlayers()) do
+    local players = Players:GetPlayers()
+    for i = 1, #players do
+        local player = players[i]
         if isValidEnemy(player) then
-            local tempPart = self:GetTargetPart(player.Character)
-            if tempPart and (not State.WallCheck or VisibilityService:CheckVisibility(player.Character, 1, tempPart)) then
-                local screenPoint, onScreen = camera:WorldToViewportPoint(tempPart.Position)
+            local part = self:GetTargetPart(player.Character)
+            if part then
+                -- [PERF] เช็คจอ+ระยะก่อน (ถูก) แล้วค่อย raycast (แพง) เป็นอันดับสุดท้าย
+                -- เดิม: raycast ก่อน ทั้งที่เป้าอาจอยู่นอก FOV เสียเปล่า
+                local screenPoint, onScreen = camera:WorldToViewportPoint(part.Position)
                 if onScreen and screenPoint.Z > 0 then
                     local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
-                    if dist < shortestDist then
-                        shortestDist = dist
-                        closestPlayer = player
-                        bestPart = tempPart
+                    if dist < closestDist then
+                        if not State.WallCheck
+                            or VisibilityService:CheckVisibility(player.Character, 1, part) then
+                            closestDist = dist
+                            closestPlayer = player
+                            bestPart = part
+                        end
                     end
                 end
             end
@@ -342,6 +411,7 @@ function TargetService:AcquireTarget(camera, screenCenter)
     end
 
     if closestPlayer then
+        -- [BUG 4 FIX เดิมคงไว้] เปลี่ยนเป้าใหม่ = เคลียร์ Random-mode lock
         if closestPlayer ~= self.CurrentTarget then
             self.LockedPartName = nil
         end
@@ -351,7 +421,7 @@ function TargetService:AcquireTarget(camera, screenCenter)
 end
 
 -- ==========================================
--- 6. ADVANCED PREDICTION ENGINE
+-- 7. ADVANCED PREDICTION ENGINE
 -- ==========================================
 local TargetStates = {}
 local MAX_SAMPLE_DT = 0.1
@@ -400,16 +470,8 @@ local function getTargetAcceleration(targetPart, targetVel, currentTime)
     state.lastTime = currentTime
 
     local rawAcceleration = (targetVel - previousVelocity) / dt
-    local smoothing = 0.15
-    state.smoothedAcceleration = (state.smoothedAcceleration or Vector3.zero):Lerp(rawAcceleration, smoothing)
-
+    state.smoothedAcceleration = state.smoothedAcceleration:Lerp(rawAcceleration, 0.15)
     return state.smoothedAcceleration
-end
-
-local function safeUnit(v3)
-    local mag = v3.Magnitude
-    if mag <= 1e-6 then return nil end
-    return v3 / mag
 end
 
 local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec)
@@ -442,9 +504,8 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
     local f1 = f(t1)
     local t_intercept = t1
     local tolerance = 0.001
-    local maxIterations = 8
 
-    for i = 1, maxIterations do
+    for _ = 1, 8 do
         if math.abs(f1 - f0) < 1e-6 then break end
         local next_t = t1 - f1 * (t1 - t0) / (f1 - f0)
         if next_t ~= next_t or next_t == math.huge or next_t == -math.huge then
@@ -462,7 +523,8 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
     if state then
         local prevPredictionTime = state.lastPredictionTime or t_intercept
         local maxChangePerFrame = 0.02
-        t_intercept = prevPredictionTime + math.clamp(t_intercept - prevPredictionTime, -maxChangePerFrame, maxChangePerFrame)
+        t_intercept = prevPredictionTime
+            + math.clamp(t_intercept - prevPredictionTime, -maxChangePerFrame, maxChangePerFrame)
         state.lastPredictionTime = t_intercept
     end
 
@@ -479,333 +541,256 @@ local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletG
     return safeUnit(displacement)
 end
 
-local function getPredictedPosition(targetPart, rootPart)
+-- [BUG 10 FIX] ตัดพารามิเตอร์ rootPart ที่ไม่เคยถูกใช้ทิ้ง
+local lastGravVal, lastGravVec = nil, nil
+
+local function getPredictedPosition(targetPart, shooterPos)
     local targetPos = targetPart.Position
     if not State.Prediction then return targetPos end
 
-    local camera = getCamera()
-    if not camera then return targetPos end
+    -- [PERF] cache Vector3 ของแรงโน้มถ่วง สร้างใหม่เฉพาะเมื่อค่าเปลี่ยน
+    if lastGravVal ~= WeaponService.Gravity then
+        lastGravVal = WeaponService.Gravity
+        lastGravVec = Vector3.new(0, -lastGravVal, 0)
+    end
 
-    local shooterPos = camera.CFrame.Position
     local bulletSpeed = math.max(WeaponService.Speed, 1)
-    local bulletGravityVec = Vector3.new(0, -WeaponService.Gravity, 0)
-
-    local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec)
+    local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, lastGravVec)
     if aimDirection then return shooterPos + (aimDirection * 10000) end
 
     return targetPos
 end
 
 -- ==========================================
--- 6.5 SILENT AIM ENGINE (namecall hook)
--- ==========================================
--- One __namecall hook covers all three paths:
---   "Raycast"/"FindPartOnRay" -> steer the game's own ballistic ray at the
---     predicted point, solved from the ray's real origin (muzzle), killing
---     the parallax error a camera-rotating aimbot can never fix.
---   "FireServer" -> rewrite direction-shaped args (Vector3) and muzzle-shaped
---     CFrames for remote-validated guns (ACS 1.x style). Game-specific: verify
---     remote arg layout per game; this heuristic covers the common layouts.
--- Guards: checkcaller() keeps OUR rays (ESP/visibility) untouched;
--- getcallingscript() restricts redirects to Tool scripts only.
-local SilentAim = {
-    Hooked = false,
-    OriginalNamecall = nil
-}
-
-function SilentAim:GetAimDirection(origin)
-    local part = TargetService.TargetPart
-    if not (part and part.Parent) then return nil end
-
-    if not State.Prediction then
-        local d = part.Position - origin
-        return d.Magnitude > 1e-6 and d.Unit or nil
-    end
-
-    return solveInterceptVector(
-        origin,
-        part,
-        math.max(WeaponService.Speed, 1),
-        Vector3.new(0, -WeaponService.Gravity, 0)
-    )
-end
-
-function SilentAim:CallerIsGunScript()
-    local ok, caller = pcall(getcallingscript)
-    if not ok or typeof(caller) ~= "Instance" then return false end
-    return caller:FindFirstAncestorOfClass("Tool") ~= nil
-end
-
-function SilentAim:Install()
-    if self.Hooked then return end
-    self.Hooked = true
-
-    self.OriginalNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        local method = getnamecallmethod()
-
-        if State.SilentAim and not checkcaller() then
-            -- ---- PATH A: steer ballistic rays --------------------------------
-            if State.SilentMethod == "Raycast" and (self == Workspace) then
-                if method == "Raycast" then
-                    local args = table.pack(...)
-                    local origin, dir = args[1], args[2]
-                    if typeof(origin) == "Vector3" and typeof(dir) == "Vector3"
-                        and dir.Magnitude > 1e-6 and SilentAim:CallerIsGunScript() then
-                        local aimDir = SilentAim:GetAimDirection(origin)
-                        if aimDir then
-                            args[2] = aimDir * dir.Magnitude -- preserve ray length
-                            return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
-                        end
-                    end
-                elseif method == "FindPartOnRay" then
-                    local args = table.pack(...)
-                    local ray = args[1]
-                    if typeof(ray) == "Ray" and ray.Direction.Magnitude > 1e-6
-                        and SilentAim:CallerIsGunScript() then
-                        local aimDir = SilentAim:GetAimDirection(ray.Origin)
-                        if aimDir then
-                            args[1] = Ray.new(ray.Origin, aimDir * ray.Direction.Magnitude)
-                            return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
-                        end
-                    end
-                end
-
-            -- ---- PATH B: rewrite FireServer args (remote-validated guns) ------
-            elseif State.SilentMethod == "Remote" and method == "FireServer" then
-                local part = TargetService.TargetPart
-                if part and part.Parent and SilentAim:CallerIsGunScript() then
-                    local camera = getCamera()
-                    if camera then
-                        local origin = camera.CFrame.Position
-                        local aimDir = SilentAim:GetAimDirection(origin)
-                            or camera.CFrame.LookVector
-                        local args = table.pack(...)
-                        for i = 1, args.n do
-                            local a = args[i]
-                            local t = typeof(a)
-                            if t == "Vector3" then
-                                -- Direction-shaped arg: near-unit vector, not a position.
-                                local mag = a.Magnitude
-                                if mag > 1e-6 and mag < 10 then args[i] = aimDir end
-                            elseif t == "CFrame" then
-                                -- Muzzle-shaped arg: sits near the camera, gets re-aimed.
-                                if (a.Position - origin).Magnitude < 5 then
-                                    args[i] = CFrame.lookAt(a.Position, a.Position + aimDir)
-                                end
-                            end
-                        end
-                        return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
-                    end
-                end
-            end
-        end
-
-        return SilentAim.OriginalNamecall(self, ...)
-    end))
-end
-
-function SilentAim:Uninstall()
-    if not self.Hooked then return end
-    self.Hooked = false
-    -- Restore the original namecall so the game runs clean after unload.
-    if self.OriginalNamecall then
-        pcall(function() hookmetamethod(game, "__namecall", self.OriginalNamecall) end)
-        self.OriginalNamecall = nil
-    end
-end
-
-CleanupManager:AddCustomCleanup(function() SilentAim:Uninstall() end)
-SilentAim:Install()
-
--- ==========================================
--- 7. ESP SERVICE (30Hz, cached part refs)
+-- 8. ESP SERVICE (Throttle 30Hz, Ref-Cached)
 -- ==========================================
 local ESPService = {
-    Cache = {},
+    Cache = {}, -- [player] = { Character, Visible, LastCheck, Highlight, NameTag, ShownVisible }
     COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
-    COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50)
+    COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50),
+    OUTLINE_VISIBLE = Color3.fromRGB(255, 215, 0),
+    OUTLINE_OBSTRUCTED = Color3.fromRGB(100, 0, 0)
 }
 
 function ESPService:ClearAll()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player.Character then
-            local hl = player.Character:FindFirstChild("ESP_Highlight")
-            if hl then hl:Destroy() end
-            local nt = player.Character:FindFirstChild("ESP_NameTag")
-            if nt then nt:Destroy() end
+        for _, player in ipairs(Players:GetPlayers()) do
+                local char = player.Character
+                if char then
+                        local hl = char:FindFirstChild("ESP_Highlight")
+                        if hl then hl:Destroy() end
+                        local nt = char:FindFirstChild("ESP_NameTag")
+                        if nt then nt:Destroy() end
+                end
         end
-    end
-    table.clear(self.Cache)
+        table.clear(self.Cache)
 end
 CleanupManager:AddCustomCleanup(function() ESPService:ClearAll() end)
 
 CleanupManager:AddConn("PlayerRemovingESP", Players.PlayerRemoving:Connect(function(player)
-    ESPService.Cache[player] = nil
+        ESPService.Cache[player] = nil
 end))
 
-function ESPService:ProcessESP()
-    local now = tick()
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer and player.Character then
-            local isEnemy = isValidEnemy(player)
-            local char = player.Character
+local function buildNameTag(char, head, text)
+        local nameTag = Instance.new("BillboardGui")
+        nameTag.Name = "ESP_NameTag"
+        nameTag.Adornee = head
+        nameTag.Size = UDim2.new(0, 150, 0, 30)
+        nameTag.StudsOffset = Vector3.new(0, 2, 0)
+        nameTag.AlwaysOnTop = true
+        nameTag.MaxDistance = 1500 -- [PERF] ไกลเกินนี้ไม่ render tag
 
-            local cached = self.Cache[player]
-            -- [PERF] Cached refs instead of FindFirstChild per player per tick.
-            local highlight = cached and cached.Highlight
-            if highlight and highlight.Parent ~= char then highlight = nil end
-            local nameTag = cached and cached.NameTag
-            if nameTag and nameTag.Parent ~= char then nameTag = nil end
+        local textLabel = Instance.new("TextLabel")
+        textLabel.Name = "TagLabel"
+        textLabel.Size = UDim2.new(1, 0, 1, 0)
+        textLabel.BackgroundTransparency = 1
+        textLabel.Text = text
+        textLabel.TextStrokeTransparency = 0
+        textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+        textLabel.Font = Enum.Font.SourceSansBold
+        textLabel.TextSize = 14
+        textLabel.Parent = nameTag
 
-            if (not State.ESP and not State.ESPName) or not isEnemy then
-                if highlight then highlight:Destroy() end
-                if nameTag then nameTag:Destroy() end
-                if cached then cached.Highlight, cached.NameTag = nil, nil end
-                continue
-            end
-
-            if not cached or cached.Character ~= char or (now - cached.LastCheck > 0.35) then
-                self.Cache[player] = {
-                    Character = char,
-                    Visible = VisibilityService:CheckVisibility(char, 5),
-                    LastCheck = now,
-                    Highlight = highlight,
-                    NameTag = nameTag
-                }
-                cached = self.Cache[player]
-            end
-
-            local visible = cached.Visible
-            local currentColor = visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
-
-            if State.ESP then
-                if not highlight then
-                    highlight = Instance.new("Highlight")
-                    highlight.Name = "ESP_Highlight"
-                    highlight.FillTransparency = 0.25
-                    highlight.Parent = char
-                    cached.Highlight = highlight
-                end
-                highlight.FillColor = currentColor
-                highlight.OutlineColor = visible and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(100, 0, 0)
-            elseif highlight then
-                highlight:Destroy()
-                cached.Highlight = nil
-            end
-
-            if State.ESPName then
-                local head = char:FindFirstChild("Head")
-                if head then
-                    if not nameTag then
-                        nameTag = Instance.new("BillboardGui")
-                        nameTag.Name = "ESP_NameTag"
-                        nameTag.Adornee = head
-                        nameTag.Size = UDim2.new(0, 150, 0, 30)
-                        nameTag.StudsOffset = Vector3.new(0, 2, 0)
-                        nameTag.AlwaysOnTop = true
-                        nameTag.Parent = char
-                        cached.NameTag = nameTag
-
-                        local textLabel = Instance.new("TextLabel")
-                        textLabel.Name = "TagLabel"
-                        textLabel.Size = UDim2.new(1, 0, 1, 0)
-                        textLabel.BackgroundTransparency = 1
-                        textLabel.Text = player.Name
-                        textLabel.TextStrokeTransparency = 0
-                        textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
-                        textLabel.Font = Enum.Font.SourceSansBold
-                        textLabel.TextSize = 14
-                        textLabel.Parent = nameTag
-                    end
-                    nameTag.TagLabel.TextColor3 = currentColor
-                end
-            elseif nameTag then
-                nameTag:Destroy()
-                cached.NameTag = nil
-            end
-        end
-    end
+        nameTag.Parent = char
+        return nameTag
 end
 
+function ESPService:ProcessESP()
+        local now = os.clock()
+        local players = Players:GetPlayers()
+
+        for i = 1, #players do
+                local player = players[i]
+                if player ~= LocalPlayer then
+                        local char = player.Character
+
+                        -- [BUG 4 FIX] ไม่มี character = เคลียร์ cache ทิ้ง
+                        -- เดิม: entry ค้างถือ reference ของ character ที่ถูก destroy ตลอดไป
+                        if not char then
+                                self.Cache[player] = nil
+                        else
+                                local entry = self.Cache[player]
+                                if not entry or entry.Character ~= char then
+                                        entry = {
+                                                Character = char,
+                                                Visible = false,
+                                                LastCheck = 0,
+                                                Highlight = char:FindFirstChild("ESP_Highlight"),
+                                                NameTag = char:FindFirstChild("ESP_NameTag"),
+                                                ShownVisible = nil
+                                        }
+                                        self.Cache[player] = entry
+                                end
+
+                                local isEnemy = isValidEnemy(player)
+
+                                if not isEnemy or (not State.ESP and not State.ESPName) then
+                                        -- [PERF] ใช้ ref จาก cache แทน FindFirstChild ทุก tick
+                                        if entry.Highlight then entry.Highlight:Destroy(); entry.Highlight = nil end
+                                        if entry.NameTag then entry.NameTag:Destroy(); entry.NameTag = nil end
+                                        entry.ShownVisible = nil
+                                else
+                                        if now - entry.LastCheck >= 0.35 then
+                                                entry.Visible = VisibilityService:CheckVisibility(char, 5, nil)
+                                                entry.LastCheck = now
+                                        end
+
+                                        -- [BUG 8 FIX] เขียน property เฉพาะเมื่อสีจะเปลี่ยนจริง
+                                        -- เดิม: set สีใหม่ 30 ครั้ง/วินาที ทั้งที่ค่าเดิม = dirty flag ใส่ renderer ฟรี
+                                        if State.ESP then
+                                                local hl = entry.Highlight
+                                                if not hl or hl.Parent ~= char then
+                                                        hl = Instance.new("Highlight")
+                                                        hl.Name = "ESP_Highlight"
+                                                        hl.FillTransparency = 0.25
+                                                        hl.Parent = char
+                                                        entry.Highlight = hl
+                                                        entry.ShownVisible = nil
+                                                end
+                                                if entry.ShownVisible ~= entry.Visible then
+                                                        hl.FillColor = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+                                                        hl.OutlineColor = entry.Visible and self.OUTLINE_VISIBLE or self.OUTLINE_OBSTRUCTED
+                                                        entry.ShownVisible = entry.Visible
+                                                end
+                                        elseif entry.Highlight then
+                                                entry.Highlight:Destroy()
+                                                entry.Highlight = nil
+                                                entry.ShownVisible = nil
+                                        end
+
+                                        if State.ESPName then
+                                                local head = char:FindFirstChild("Head")
+                                                if head then
+                                                        local nt = entry.NameTag
+                                                        if not nt or nt.Parent ~= char then
+                                                                entry.NameTag = buildNameTag(char, head, player.Name)
+                                                                nt = entry.NameTag
+                                                        end
+                                                        local color = entry.Visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+                                                        local label = nt:FindFirstChild("TagLabel")
+                                                        if label and label.TextColor3 ~= color then
+                                                                label.TextColor3 = color
+                                                        end
+                                                elseif entry.NameTag then
+                                                        entry.NameTag:Destroy()
+                                                        entry.NameTag = nil
+                                                end
+                                        elseif entry.NameTag then
+                                                entry.NameTag:Destroy()
+                                                entry.NameTag = nil
+                                        end
+                                end
+                        end
+                end
+        end
+end
+
+-- 30Hz throttle คงเดิม (Heartbeat + accumulator)
 local espAccumulator = 0
 local ESP_INTERVAL = 1 / 30
 CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt)
-    if not State.ESP and not State.ESPName then return end
-    espAccumulator = espAccumulator + dt
-    if espAccumulator >= ESP_INTERVAL then
-        espAccumulator = 0
-        ESPService:ProcessESP()
-    end
+        if not State.ESP and not State.ESPName then return end
+        espAccumulator += dt
+        if espAccumulator >= ESP_INTERVAL then
+                espAccumulator = 0
+                ESPService:ProcessESP()
+        end
 end))
 
 -- ==========================================
--- 8. MAIN CAMERA ENGINE
+-- 9. MAIN CAMERA ENGINE
 -- ==========================================
--- Drawing lib exists in all mainstream executors; guard keeps partial
--- environments (custom sandboxes) from dying at load over a cosmetic circle.
-local okDrawing, FOVCircle = pcall(Drawing.new, "Circle")
-if okDrawing and FOVCircle then
-    FOVCircle.Thickness = 1.5
-    FOVCircle.Color = Color3.fromRGB(255, 255, 255)
-    FOVCircle.Filled = false
-    FOVCircle.Transparency = 0.7
-    CleanupManager:AddDrawing("FOVCircle", FOVCircle)
-else
-    FOVCircle = nil
-end
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 1.5
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+FOVCircle.Filled = false
+FOVCircle.Transparency = 0.7
+FOVCircle.Visible = false
+CleanupManager:AddDrawing("FOVCircle", FOVCircle)
 
 local function hasActiveWeapon()
-    local character = LocalPlayer.Character
-    if not character then return false end
-    local tool = character:FindFirstChildOfClass("Tool")
-    return tool ~= nil
+        local character = LocalPlayer and LocalPlayer.Character
+        return character ~= nil and character:FindFirstChildOfClass("Tool") ~= nil
 end
 
+local frameTick = 0
+
 CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
-    local camera = getCamera()
-    if not camera then return end
+        local camera = getCamera()
+        if not camera then return end
 
-    local screenCenter = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
-    if FOVCircle then
-        FOVCircle.Position = screenCenter
-        FOVCircle.Radius = scaleFov(State.FOV)
-        FOVCircle.Visible = State.ShowFOV
-    end
+        -- [PERF] คำนวณ scaled FOV ครั้งเดียวต่อเฟรม (เดิมคิดซ้ำ 3 จุด)
+        local vp = camera.ViewportSize
+        local screenCenter = Vector2.new(vp.X * 0.5, vp.Y * 0.5)
+        local scaledFOV = State.FOV * (vp.Y / 1080)
 
-    -- [RESTRUCTURE] One shared target pipeline feeds both modes: silent aim
-    -- acquires targets while the camera stays free; camera-rotation only
-    -- applies when State.Aimbot is on.
-    local needTarget = State.Aimbot or State.SilentAim
-    if not needTarget or not hasActiveWeapon() then
-        TargetService:ReleaseTarget()
-        return
-    end
-
-    if TargetService.CurrentTarget then
-        if not TargetService:KeepTarget(camera, screenCenter) then
-            TargetService:ReleaseTarget()
+        -- [BUG 11 FIX] อัปเดตวง FOV เฉพาะตอนแสดงผล
+        if State.ShowFOV then
+                FOVCircle.Position = screenCenter
+                FOVCircle.Radius = scaledFOV
+                FOVCircle.Visible = true
+        elseif FOVCircle.Visible then
+                FOVCircle.Visible = false
         end
-    end
 
-    if not TargetService.CurrentTarget then
-        TargetService:AcquireTarget(camera, screenCenter)
-    end
+        if not State.Aimbot or not hasActiveWeapon() then
+                if TargetService.CurrentTarget then TargetService:ReleaseTarget() end
+                return
+        end
 
-    if State.Aimbot and TargetService.CurrentTarget and TargetService.TargetPart then
-        local targetPos = getPredictedPosition(TargetService.TargetPart, TargetService.CurrentTarget.Character:FindFirstChild("HumanoidRootPart"))
-        local desiredDirection = (targetPos - camera.CFrame.Position).Unit
-        local lerpSpeed = math.clamp(State.Smoothness * 35, 1, 60)
-        local alpha = 1 - math.exp(-lerpSpeed * deltaTime)
+        if TargetService.CurrentTarget then
+                if not TargetService:KeepTarget(camera, screenCenter, scaledFOV) then
+                        TargetService:ReleaseTarget()
+                end
+        end
 
-        -- [FIX 4] Rotate via CFrame:Lerp (slerp on the rotation) instead of
-        -- lerping LookVector, which distorts aim when pitched near +/-90deg.
-        local targetCF = CFrame.lookAt(camera.CFrame.Position, camera.CFrame.Position + desiredDirection)
-        camera.CFrame = camera.CFrame:Lerp(targetCF, alpha)
-    end
+        -- [PERF] acquire สแกน 30Hz (keep target ยังล็อกทุกเฟรม — การเล็งไม่กระตุก)
+        if not TargetService.CurrentTarget then
+                frameTick += 1
+                if frameTick % 2 == 0 then
+                        TargetService:AcquireTarget(camera, screenCenter, scaledFOV)
+                end
+        end
+
+        local targetPart = TargetService.TargetPart
+        if TargetService.CurrentTarget and targetPart and targetPart.Parent then
+                local shooterPos = camera.CFrame.Position
+                local targetPos = getPredictedPosition(targetPart, shooterPos)
+
+                -- [BUG 6 FIX ฝั่งนี้ด้วย] กัน .Unit บนเวกเตอร์ยาว 0
+                local desiredDirection = safeUnit(targetPos - shooterPos)
+                if desiredDirection then
+                        local lerpSpeed = math.clamp(State.Smoothness * 35, 1, 60)
+                        local alpha = 1 - math.exp(-lerpSpeed * deltaTime)
+                        local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha))
+                        if smoothDirection then
+                                camera.CFrame = CFrame.lookAt(shooterPos, shooterPos + smoothDirection)
+                        end
+                end
+        end
 end))
 
 -- ==========================================
--- 9. UI CONSTRUCTION
+-- 10. UI CONSTRUCTION
 -- ==========================================
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "SnyX_UI"
@@ -822,7 +807,6 @@ ToggleBtn.TextColor3 = Color3.fromRGB(180, 0, 255)
 ToggleBtn.Font = Enum.Font.SourceSansBold
 ToggleBtn.TextSize = 14
 ToggleBtn.Active = true
-ToggleBtn.Draggable = true
 ToggleBtn.Parent = ScreenGui
 
 local btnCorner = Instance.new("UICorner")
@@ -839,7 +823,6 @@ MainFrame.Size = UDim2.new(0, 290, 0, 380)
 MainFrame.Position = UDim2.new(0.15, 0, 0.25, 0)
 MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 MainFrame.Active = true
-MainFrame.Draggable = true
 MainFrame.Visible = false
 MainFrame.Parent = ScreenGui
 
@@ -851,9 +834,43 @@ local mainStroke = Instance.new("UIStroke")
 mainStroke.Color = Color3.fromRGB(45, 45, 45)
 mainStroke.Parent = MainFrame
 
-ToggleBtn.MouseButton1Click:Connect(function()
-    MainFrame.Visible = not MainFrame.Visible
-end)
+-- [BUG 7 FIX] เลิกใช้ Draggable (deprecated + hijack input ทั้งเฟรม)
+-- → manual drag เฉพาะ handle ที่กำหนด กด slider/toggle แล้วหน้าต่างไม่ขยับ
+local dragConnIndex = 0
+local function enableDrag(handle, target)
+        local dragging = false
+        local dragStart, startPos
+
+        dragConnIndex += 1
+        CleanupManager:AddConn("DragBegan" .. dragConnIndex, handle.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                        or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+                        dragStart = input.Position
+                        startPos = target.Position
+                end
+        end))
+
+        dragConnIndex += 1
+        CleanupManager:AddConn("DragEnded" .. dragConnIndex, handle.InputEnded:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                        or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = false
+                end
+        end))
+
+        dragConnIndex += 1
+        CleanupManager:AddConn("DragMoved" .. dragConnIndex, UserInputService.InputChanged:Connect(function(input)
+                if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                        or input.UserInputType == Enum.UserInputType.Touch) then
+                        local delta = input.Position - dragStart
+                        target.Position = UDim2.new(
+                                startPos.X.Scale, startPos.X.Offset + delta.X,
+                                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                        )
+                end
+        end))
+end
 
 local TitleBar = Instance.new("TextLabel")
 TitleBar.Size = UDim2.new(1, 0, 0, 35)
@@ -869,6 +886,14 @@ local titleCorner = Instance.new("UICorner")
 titleCorner.CornerRadius = UDim.new(0, 8)
 titleCorner.Parent = TitleBar
 
+ToggleBtn.MouseButton1Click:Connect(function()
+        MainFrame.Visible = not MainFrame.Visible
+end)
+
+-- ลากปุ่ม SnyX ด้วยตัวปุ่ม / ลากหน้าต่างเฉพาะที่ TitleBar
+enableDrag(ToggleBtn, ToggleBtn)
+enableDrag(TitleBar, MainFrame)
+
 local ScrollFrame = Instance.new("ScrollingFrame")
 ScrollFrame.Size = UDim2.new(1, -10, 1, -45)
 ScrollFrame.Position = UDim2.new(0, 5, 0, 40)
@@ -881,200 +906,202 @@ UIList.Padding = UDim.new(0, 6)
 UIList.SortOrder = Enum.SortOrder.LayoutOrder
 UIList.Parent = ScrollFrame
 UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-    ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
+        ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
 end)
 
 local currentLayoutOrder = 0
 
--- [FIX 3] Step-aware formatting: no more 0.30000000000000004 in the value label.
-local function formatSliderValue(v, step)
-    if step >= 1 then return tostring(math.floor(v + 0.5)) end
-    return string.format("%.2f", v)
-end
-
 local function createToggle(text, initialState, callback)
-    currentLayoutOrder = currentLayoutOrder + 1
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, 0, 0, 32)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
-    frame.LayoutOrder = currentLayoutOrder
-    frame.Parent = ScrollFrame
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 32)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+        frame.LayoutOrder = currentLayoutOrder
+        frame.Parent = ScrollFrame
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = frame
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = frame
 
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.7, -10, 1, 0)
-    label.Position = UDim2.new(0.04, 0, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.TextColor3 = Color3.fromRGB(220, 220, 220)
-    label.Font = Enum.Font.SourceSans
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = frame
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0.7, -10, 1, 0)
+        label.Position = UDim2.new(0.04, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220)
+        label.Font = Enum.Font.SourceSans
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
 
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 48, 0, 20)
-    btn.Position = UDim2.new(1, -54, 0.5, -10)
-    btn.BackgroundColor3 = initialState and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
-    btn.Text = initialState and "ON" or "OFF"
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.SourceSansBold
-    btn.TextSize = 11
-    btn.Parent = frame
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 48, 0, 20)
+        btn.Position = UDim2.new(1, -54, 0.5, -10)
+        btn.BackgroundColor3 = initialState and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+        btn.Text = initialState and "ON" or "OFF"
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.SourceSansBold
+        btn.TextSize = 11
+        btn.Parent = frame
 
-    local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 4)
-    btnCorner.Parent = btn
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 4)
+        btnCorner.Parent = btn
 
-    local isToggled = initialState
-    btn.MouseButton1Click:Connect(function()
-        isToggled = not isToggled
-        btn.Text = isToggled and "ON" or "OFF"
-        btn.BackgroundColor3 = isToggled and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
-        callback(isToggled)
-    end)
+        local isToggled = initialState
+        btn.MouseButton1Click:Connect(function()
+                isToggled = not isToggled
+                btn.Text = isToggled and "ON" or "OFF"
+                btn.BackgroundColor3 = isToggled and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+                callback(isToggled)
+        end)
 end
 
 local function createModeSelector(text, modesArray, initialIndex, callback)
-    currentLayoutOrder = currentLayoutOrder + 1
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, 0, 0, 32)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
-    frame.LayoutOrder = currentLayoutOrder
-    frame.Parent = ScrollFrame
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 32)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+        frame.LayoutOrder = currentLayoutOrder
+        frame.Parent = ScrollFrame
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = frame
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = frame
 
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.5, -10, 1, 0)
-    label.Position = UDim2.new(0.04, 0, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.TextColor3 = Color3.fromRGB(220, 220, 220)
-    label.Font = Enum.Font.SourceSans
-    label.TextSize = 12
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = frame
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0.5, -10, 1, 0)
+        label.Position = UDim2.new(0.04, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220)
+        label.Font = Enum.Font.SourceSans
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
 
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 80, 0, 20)
-    btn.Position = UDim2.new(1, -86, 0.5, -10)
-    btn.BackgroundColor3 = Color3.fromRGB(50, 100, 150)
-    btn.Text = modesArray[initialIndex]
-    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.SourceSansBold
-    btn.TextSize = 11
-    btn.Parent = frame
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 80, 0, 20)
+        btn.Position = UDim2.new(1, -86, 0.5, -10)
+        btn.BackgroundColor3 = Color3.fromRGB(50, 100, 150)
+        btn.Text = modesArray[initialIndex]
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.SourceSansBold
+        btn.TextSize = 11
+        btn.Parent = frame
 
-    local btnCorner = Instance.new("UICorner")
-    btnCorner.CornerRadius = UDim.new(0, 4)
-    btnCorner.Parent = btn
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 4)
+        btnCorner.Parent = btn
 
-    local currentIndex = initialIndex
-    btn.MouseButton1Click:Connect(function()
-        currentIndex = currentIndex + 1
-        if currentIndex > #modesArray then currentIndex = 1 end
-        btn.Text = modesArray[currentIndex]
-        callback(modesArray[currentIndex])
-    end)
+        local currentIndex = initialIndex
+        btn.MouseButton1Click:Connect(function()
+                currentIndex += 1
+                if currentIndex > #modesArray then currentIndex = 1 end
+                btn.Text = modesArray[currentIndex]
+                callback(modesArray[currentIndex])
+        end)
 end
 
 local function createSlider(text, min, max, default, step, callback)
-    currentLayoutOrder = currentLayoutOrder + 1
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(1, 0, 0, 48)
-    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
-    frame.LayoutOrder = currentLayoutOrder
-    frame.Parent = ScrollFrame
+        currentLayoutOrder += 1
+        local frame = Instance.new("Frame")
+        frame.Size = UDim2.new(1, 0, 0, 48)
+        frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+        frame.LayoutOrder = currentLayoutOrder
+        frame.Parent = ScrollFrame
 
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 6)
-    corner.Parent = frame
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 6)
+        corner.Parent = frame
 
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.6, 0, 0, 20)
-    label.Position = UDim2.new(0.04, 0, 0, 3)
-    label.BackgroundTransparency = 1
-    label.Text = text
-    label.TextColor3 = Color3.fromRGB(220, 220, 220)
-    label.Font = Enum.Font.SourceSans
-    label.TextSize = 11
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Parent = frame
+        local label = Instance.new("TextLabel")
+        label.Size = UDim2.new(0.6, 0, 0, 20)
+        label.Position = UDim2.new(0.04, 0, 0, 3)
+        label.BackgroundTransparency = 1
+        label.Text = text
+        label.TextColor3 = Color3.fromRGB(220, 220, 220)
+        label.Font = Enum.Font.SourceSans
+        label.TextSize = 11
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = frame
 
-    local valLabel = Instance.new("TextLabel")
-    valLabel.Size = UDim2.new(0.3, 0, 0, 20)
-    valLabel.Position = UDim2.new(0.65, 0, 0, 3)
-    valLabel.BackgroundTransparency = 1
-    valLabel.Text = formatSliderValue(default, step)
-    valLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-    valLabel.Font = Enum.Font.SourceSansBold
-    valLabel.TextSize = 11
-    valLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valLabel.Parent = frame
+        local valLabel = Instance.new("TextLabel")
+        valLabel.Size = UDim2.new(0.3, 0, 0, 20)
+        valLabel.Position = UDim2.new(0.65, 0, 0, 3)
+        valLabel.BackgroundTransparency = 1
+        valLabel.Text = tostring(default)
+        valLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+        valLabel.Font = Enum.Font.SourceSansBold
+        valLabel.TextSize = 11
+        valLabel.TextXAlignment = Enum.TextXAlignment.Right
+        valLabel.Parent = frame
 
-    local sliderBar = Instance.new("TextButton")
-    sliderBar.Size = UDim2.new(0.92, 0, 0, 6)
-    sliderBar.Position = UDim2.new(0.04, 0, 0, 30)
-    sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    sliderBar.Text = ""
-    sliderBar.AutoButtonColor = false
-    sliderBar.Parent = frame
+        local sliderBar = Instance.new("TextButton")
+        sliderBar.Size = UDim2.new(0.92, 0, 0, 6)
+        sliderBar.Position = UDim2.new(0.04, 0, 0, 30)
+        sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+        sliderBar.Text = ""
+        sliderBar.AutoButtonColor = false
+        sliderBar.Parent = frame
 
-    local barCorner = Instance.new("UICorner")
-    barCorner.CornerRadius = UDim.new(0, 3)
-    barCorner.Parent = sliderBar
+        local barCorner = Instance.new("UICorner")
+        barCorner.CornerRadius = UDim.new(0, 3)
+        barCorner.Parent = sliderBar
 
-    local sliderFill = Instance.new("Frame")
-    local initialRatio = math.clamp((default - min) / (max - min), 0, 1)
-    sliderFill.Size = UDim2.new(initialRatio, 0, 1, 0)
-    sliderFill.BackgroundColor3 = Color3.fromRGB(180, 0, 255)
-    sliderFill.BorderSizePixel = 0
-    sliderFill.Parent = sliderBar
+        local sliderFill = Instance.new("Frame")
+        local initialRatio = math.clamp((default - min) / (max - min), 0, 1)
+        sliderFill.Size = UDim2.new(initialRatio, 0, 1, 0)
+        sliderFill.BackgroundColor3 = Color3.fromRGB(180, 0, 255)
+        sliderFill.BorderSizePixel = 0
+        sliderFill.Parent = sliderBar
 
-    local fillCorner = Instance.new("UICorner")
-    fillCorner.CornerRadius = UDim.new(0, 3)
-    fillCorner.Parent = sliderFill
+        local fillCorner = Instance.new("UICorner")
+        fillCorner.CornerRadius = UDim.new(0, 3)
+        fillCorner.Parent = sliderFill
 
-    local dragging = false
-    sliderBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            local function update(inp)
-                local ratio = math.clamp((inp.Position.X - sliderBar.AbsolutePosition.X) / sliderBar.AbsoluteSize.X, 0, 1)
-                local stepped = math.floor((min + (ratio * (max - min))) / step + 0.5) * step
-                stepped = math.clamp(stepped, min, max)
-                sliderFill.Size = UDim2.new((stepped - min) / (max - min), 0, 1, 0)
-                valLabel.Text = formatSliderValue(stepped, step)
-                callback(stepped)
-            end
-            update(input)
-            local moveConn, relConn
-            moveConn = UserInputService.InputChanged:Connect(function(moveInp)
-                if dragging and (moveInp.UserInputType == Enum.UserInputType.MouseMovement or moveInp.UserInputType == Enum.UserInputType.Touch) then
-                    update(moveInp)
+        local dragging = false
+        sliderBar.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                        or input.UserInputType == Enum.UserInputType.Touch then
+                        dragging = true
+
+                        -- [BUG 1 FIX] snap แล้วเก็บ float noise ทิ้ง
+                        -- เดิม: math.floor(x/step+0.5)*step ได้ 0.35000000000000003 โชว์บน label
+                        local function update(inp)
+                                local ratio = math.clamp(
+                                        (inp.Position.X - sliderBar.AbsolutePosition.X)
+                                        / math.max(sliderBar.AbsoluteSize.X, 1), 0, 1)
+                                local n = math.floor((min + ratio * (max - min)) / step + 0.5)
+                                local stepped = math.floor(n * step * 1e6 + 0.5) / 1e6
+                                stepped = math.clamp(stepped, min, max)
+                                sliderFill.Size = UDim2.new((stepped - min) / (max - min), 0, 1, 0)
+                                valLabel.Text = (step >= 1) and tostring(math.floor(stepped + 0.5)) or tostring(stepped)
+                                callback(stepped)
+                        end
+
+                        update(input)
+                        local moveConn, relConn
+                        moveConn = UserInputService.InputChanged:Connect(function(moveInp)
+                                if dragging and (moveInp.UserInputType == Enum.UserInputType.MouseMovement
+                                        or moveInp.UserInputType == Enum.UserInputType.Touch) then
+                                        update(moveInp)
+                                end
+                        end)
+                        relConn = UserInputService.InputEnded:Connect(function(relInp)
+                                if relInp.UserInputType == Enum.UserInputType.MouseButton1
+                                        or relInp.UserInputType == Enum.UserInputType.Touch then
+                                        dragging = false
+                                        moveConn:Disconnect()
+                                        relConn:Disconnect()
+                                end
+                        end)
                 end
-            end)
-            relConn = UserInputService.InputEnded:Connect(function(relInp)
-                if relInp.UserInputType == Enum.UserInputType.MouseButton1 or relInp.UserInputType == Enum.UserInputType.Touch then
-                    dragging = false
-                    moveConn:Disconnect()
-                    relConn:Disconnect()
-                end
-            end)
-        end
-    end)
+        end)
 end
 
 createToggle("Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
-createToggle("Silent Aim", State.SilentAim, function(v) State.SilentAim = v end)
-createModeSelector("Silent Method", {"Raycast", "Remote"}, 1, function(v) State.SilentMethod = v end)
-createModeSelector("Target Part", {"Head", "Torso", "Random"}, 1, function(v) State.TargetPartMode = v end)
+createModeSelector("Target Part", { "Head", "Torso", "Random" }, 1, function(v) State.TargetPartMode = v end)
 createToggle("Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
 createToggle("Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
 createToggle("Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
@@ -1083,25 +1110,25 @@ createToggle("Prediction Engine", State.Prediction, function(v) State.Prediction
 createToggle("Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
 
 createToggle("Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v)
-    State.DropIsMultiplier = v
-    WeaponService:UpdateAuto()
+        State.DropIsMultiplier = v
+        WeaponService:UpdateAuto()
 end)
 
 createToggle("Auto Weapon Speed", State.AutoBulletSpeed, function(v)
-    State.AutoBulletSpeed = v
-    WeaponService:UpdateAuto()
+        State.AutoBulletSpeed = v
+        WeaponService:UpdateAuto()
 end)
 
 createToggle("ESP Wallhack", State.ESP, function(v) State.ESP = v end)
 createToggle("ESP Username", State.ESPName, function(v) State.ESPName = v end)
 
 createSlider("Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v)
-    State.BulletSpeed = v
-    WeaponService:UpdateManual()
+        State.BulletSpeed = v
+        WeaponService:UpdateManual()
 end)
 createSlider("Manual Gravity", 0, 500, State.BulletGravity, 10, function(v)
-    State.BulletGravity = v
-    WeaponService:UpdateManual()
+        State.BulletGravity = v
+        WeaponService:UpdateManual()
 end)
 createSlider("Smoothness", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
 createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
