@@ -1,0 +1,1107 @@
+-- =====================================================================
+-- SNYX ADVANCED PREDICTION AIMBOT + SILENT AIM & ESP (ALL-IN-ONE FIXED)
+-- Luau (Roblox executor runtime) | R6/R15 | ACS-style + Raycast guns
+-- Re-exec safe: previous instance self-cleans (incl. namecall unhook).
+-- =====================================================================
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- ==========================================
+-- 1. CLEANUP MANAGER (Complete Lifecycle)
+-- ==========================================
+local CleanupManager = {
+    Connections = {},
+    Instances = {},
+    Drawings = {},
+    CustomCleanups = {}
+}
+
+function CleanupManager:AddConn(name, conn)
+    if self.Connections[name] then self.Connections[name]:Disconnect() end
+    self.Connections[name] = conn
+end
+
+function CleanupManager:AddInstance(name, inst)
+    if self.Instances[name] then self.Instances[name]:Destroy() end
+    self.Instances[name] = inst
+end
+
+function CleanupManager:AddDrawing(name, drawing)
+    if self.Drawings[name] then self.Drawings[name]:Remove() end
+    self.Drawings[name] = drawing
+end
+
+function CleanupManager:AddCustomCleanup(func)
+    table.insert(self.CustomCleanups, func)
+end
+
+function CleanupManager:CleanAll()
+    getgenv().SnyX_Running = false
+
+    for _, conn in pairs(self.Connections) do pcall(function() conn:Disconnect() end) end
+    for _, inst in pairs(self.Instances) do pcall(function() inst:Destroy() end) end
+    for _, draw in pairs(self.Drawings) do pcall(function() draw:Remove() end) end
+    for _, func in ipairs(self.CustomCleanups) do pcall(func) end
+
+    table.clear(self.Connections)
+    table.clear(self.Instances)
+    table.clear(self.Drawings)
+    table.clear(self.CustomCleanups)
+end
+
+if getgenv().SnyX_Cleanup then getgenv().SnyX_Cleanup:CleanAll() end
+getgenv().SnyX_Cleanup = CleanupManager
+getgenv().SnyX_Running = true
+
+-- ==========================================
+-- 2. STATE (Global Configuration)
+-- ==========================================
+local State = {
+    Aimbot = true,
+    TeamCheck = true,
+    WallCheck = false,
+    Prediction = true,
+    TargetPartMode = "Head",
+    PingCompensation = false,
+    DropIsMultiplier = false,
+    AutoBulletSpeed = true,
+    BulletSpeed = 5000,
+    BulletGravity = workspace.Gravity,
+    Smoothness = 0.8,
+    FOV = 100,
+    ShowFOV = false,
+    -- Silent Aim
+    SilentAim = false,
+    SilentMethod = "Raycast", -- "Raycast" (steer game ray) | "Remote" (rewrite FireServer args)
+    -- ESP
+    ESP = true,
+    ESPName = false
+}
+
+local function getCamera() return Workspace.CurrentCamera end
+
+local function getPing()
+    if not LocalPlayer then return 0 end
+    local success, ping = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    return (success and type(ping) == "number") and ping or 0.025
+end
+
+local function scaleFov(fovPx)
+    local camera = getCamera()
+    local vp = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+    return fovPx * (vp.Y / 1080)
+end
+
+-- ==========================================
+-- 3. WEAPON SERVICE (Cached Weapon Stats)
+-- ==========================================
+local WeaponService = {
+    Speed = 3000,
+    Gravity = workspace.Gravity
+}
+
+function WeaponService:UpdateManual()
+    if not State.AutoBulletSpeed then
+        self.Speed = math.max(State.BulletSpeed or 10000, 1)
+        self.Gravity = State.BulletGravity ~= nil and State.BulletGravity or workspace.Gravity
+    end
+end
+
+local WeaponCache = setmetatable({}, { __mode = "k" })
+
+function WeaponService:UpdateAuto()
+    if not State.AutoBulletSpeed then return self:UpdateManual() end
+
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool")
+
+    if not tool then
+        self.Speed = math.max(State.BulletSpeed or 3000, 1)
+        self.Gravity = workspace.Gravity
+        return
+    end
+
+    if WeaponCache[tool] then
+        self.Speed = WeaponCache[tool].Speed
+        self.Gravity = WeaponCache[tool].Gravity
+        return
+    end
+
+    local toolName = tool.Name:lower()
+    local isLauncher = toolName:find("rpg") or toolName:find("rocket") or toolName:find("launcher") or toolName:find("grenade")
+    local acsSettings = tool:FindFirstChild("ACS_Settings") or tool:FindFirstChild("Settings") or tool:FindFirstChild("Config")
+
+    local speed, gravity = State.BulletSpeed or 3000, workspace.Gravity
+
+    if acsSettings and acsSettings:IsA("ModuleScript") then
+        local success, config = pcall(require, acsSettings)
+        if success and type(config) == "table" then
+            local s = config.Velo or config.MuzzleVelocity or config.BulletSpeed or config.Velocity
+            speed = (type(s) == "number" and s > 0) and s or speed
+
+            local drop = config.Drop or config.BulletDrop or config.Gravity
+            if type(drop) == "number" then
+                gravity = State.DropIsMultiplier and (workspace.Gravity * drop) or drop
+            else
+                gravity = (isLauncher and not toolName:find("grenade")) and 0 or workspace.Gravity
+            end
+        end
+    end
+
+    WeaponCache[tool] = { Speed = speed, Gravity = gravity }
+    self.Speed = speed
+    self.Gravity = gravity
+end
+
+-- [FIX 1] Track per-tool config listeners so they are disconnected on
+-- tool removal / cleanup instead of leaking one connection per equip.
+local ToolConfigConns = setmetatable({}, { __mode = "k" })
+
+local function setupCharacterWeaponListener(char)
+    if not char then return end
+    CleanupManager:AddConn("ToolAdded", char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            WeaponCache[child] = nil
+            -- Config may be injected after the tool exists; invalidate cache when it arrives.
+            ToolConfigConns[child] = child.ChildAdded:Connect(function(c)
+                local cName = c.Name:lower()
+                if cName:find("acs_settings") or cName:find("settings") or cName:find("config") then
+                    WeaponCache[child] = nil
+                    WeaponService:UpdateAuto()
+                end
+            end)
+
+            task.defer(function()
+                local t = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Tool")
+                if t == child then WeaponService:UpdateAuto() end
+            end)
+        end
+    end))
+    CleanupManager:AddConn("ToolRemoved", char.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") then
+            if ToolConfigConns[child] then
+                ToolConfigConns[child]:Disconnect()
+                ToolConfigConns[child] = nil
+            end
+            WeaponCache[child] = nil
+            task.defer(function() WeaponService:UpdateAuto() end)
+        end
+    end))
+    WeaponService:UpdateAuto()
+end
+
+if LocalPlayer.Character then setupCharacterWeaponListener(LocalPlayer.Character) end
+CleanupManager:AddConn("CharAdded", LocalPlayer.CharacterAdded:Connect(setupCharacterWeaponListener))
+
+CleanupManager:AddCustomCleanup(function()
+    for tool, conn in pairs(ToolConfigConns) do
+        pcall(function() conn:Disconnect() end)
+        ToolConfigConns[tool] = nil
+    end
+end)
+
+-- [FIX 2] Live gravity sync: games that change workspace.Gravity mid-match
+-- would otherwise leave cached drop values stale. Invalidate + recompute.
+CleanupManager:AddConn("GravityChanged", Workspace:GetPropertyChangedSignal("Gravity"):Connect(function()
+    if State.AutoBulletSpeed then
+        table.clear(WeaponCache)
+        WeaponService:UpdateAuto()
+    end
+end))
+
+-- ==========================================
+-- 4. VISIBILITY SERVICE (Shared RaycastParams)
+-- ==========================================
+local VisibilityService = {}
+
+-- [PERF] One reusable RaycastParams + one scratch filter table instead of
+-- allocating both on every call (this runs dozens of times per frame).
+local SharedRayParams = RaycastParams.new()
+SharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
+SharedRayParams.IgnoreWater = true
+local ScratchFilter = {}
+
+function VisibilityService:CheckVisibility(targetCharacter, pierceCount, specificPart)
+    if not targetCharacter then return false end
+    local camera = getCamera()
+    if not camera then return false end
+
+    local targetPart = specificPart or targetCharacter:FindFirstChild("Head") or targetCharacter:FindFirstChild("HumanoidRootPart")
+    if not targetPart then return false end
+
+    local origin = camera.CFrame.Position
+    local targetPos = targetPart.Position
+    local currentOrigin = origin
+    local currentDirection = targetPos - origin
+    local maxPierces = pierceCount or 1
+
+    table.clear(ScratchFilter)
+    if LocalPlayer.Character then table.insert(ScratchFilter, LocalPlayer.Character) end
+
+    for i = 1, maxPierces do
+        SharedRayParams.FilterDescendantsInstances = ScratchFilter
+        local result = Workspace:Raycast(currentOrigin, currentDirection, SharedRayParams)
+
+        if not result then return true end
+
+        local hitPart = result.Instance
+        if hitPart:IsDescendantOf(targetCharacter) then return true end
+
+        if maxPierces > 1 and (hitPart.Transparency > 0.8 or not hitPart.CanCollide) then
+            table.insert(ScratchFilter, hitPart)
+            currentDirection = targetPos - result.Position
+            currentOrigin = result.Position + (currentDirection.Unit * 0.05)
+        else
+            return false
+        end
+    end
+    return false
+end
+
+local function isValidEnemy(player)
+    if not player or player == LocalPlayer or not player.Character then return false end
+    local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+    local rootPart = player.Character:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not rootPart or humanoid.Health <= 0 then return false end
+    if player.Character:FindFirstChildOfClass("ForceField") then return false end
+    if State.TeamCheck and player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team then return false end
+    return true
+end
+
+-- ==========================================
+-- 5. TARGET SERVICE (State Machine)
+-- ==========================================
+local TargetService = {
+    CurrentTarget = nil,
+    TargetPart = nil,
+    LockedPartName = nil
+}
+
+function TargetService:GetTargetPart(char)
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if State.TargetPartMode == "Head" then return char:FindFirstChild("Head") or root end
+    if State.TargetPartMode == "Random" then
+        if self.LockedPartName and char:FindFirstChild(self.LockedPartName) then
+            return char:FindFirstChild(self.LockedPartName)
+        end
+        local parts = {"Head", "UpperTorso", "LowerTorso", "HumanoidRootPart"}
+        local name = parts[math.random(1, #parts)]
+        self.LockedPartName = name
+        return char:FindFirstChild(name) or root
+    end
+    return root
+end
+
+function TargetService:ReleaseTarget()
+    self.CurrentTarget = nil
+    self.TargetPart = nil
+    self.LockedPartName = nil
+end
+
+function TargetService:KeepTarget(camera, screenCenter)
+    if not isValidEnemy(self.CurrentTarget) then return false end
+    if not self.TargetPart or not self.TargetPart.Parent or not self.TargetPart:IsDescendantOf(self.CurrentTarget.Character) then
+        return false
+    end
+    if State.WallCheck and not VisibilityService:CheckVisibility(self.CurrentTarget.Character, 1, self.TargetPart) then return false end
+
+    local screenPoint, onScreen = camera:WorldToViewportPoint(self.TargetPart.Position)
+    if not onScreen or screenPoint.Z <= 0 then return false end
+
+    local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
+    if dist > scaleFov(State.FOV) then return false end
+
+    return true
+end
+
+function TargetService:AcquireTarget(camera, screenCenter)
+    local closestPlayer = nil
+    local currentScaledFOV = scaleFov(State.FOV)
+    local shortestDist = currentScaledFOV
+    local bestPart = nil
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidEnemy(player) then
+            local tempPart = self:GetTargetPart(player.Character)
+            if tempPart and (not State.WallCheck or VisibilityService:CheckVisibility(player.Character, 1, tempPart)) then
+                local screenPoint, onScreen = camera:WorldToViewportPoint(tempPart.Position)
+                if onScreen and screenPoint.Z > 0 then
+                    local dist = (Vector2.new(screenPoint.X, screenPoint.Y) - screenCenter).Magnitude
+                    if dist < shortestDist then
+                        shortestDist = dist
+                        closestPlayer = player
+                        bestPart = tempPart
+                    end
+                end
+            end
+        end
+    end
+
+    if closestPlayer then
+        if closestPlayer ~= self.CurrentTarget then
+            self.LockedPartName = nil
+        end
+        self.CurrentTarget = closestPlayer
+        self.TargetPart = bestPart
+    end
+end
+
+-- ==========================================
+-- 6. ADVANCED PREDICTION ENGINE
+-- ==========================================
+local TargetStates = {}
+local MAX_SAMPLE_DT = 0.1
+local MAX_PREDICTION_TIME = 5.0
+
+task.spawn(function()
+    while getgenv().SnyX_Running and task.wait(10) do
+        for part in pairs(TargetStates) do
+            if typeof(part) ~= "Instance" or not part:IsDescendantOf(workspace) then
+                TargetStates[part] = nil
+            end
+        end
+    end
+end)
+CleanupManager:AddCustomCleanup(function() table.clear(TargetStates) end)
+
+local function getTargetAcceleration(targetPart, targetVel, currentTime)
+    local state = TargetStates[targetPart]
+
+    if not state then
+        TargetStates[targetPart] = {
+            lastVelocity = targetVel,
+            lastTime = currentTime,
+            smoothedAcceleration = Vector3.zero,
+            lastPredictionTime = 0
+        }
+        return Vector3.zero
+    end
+
+    local previousVelocity = state.lastVelocity
+    local previousTime = state.lastTime
+    local dt = currentTime - previousTime
+
+    if dt <= 0 then
+        return state.smoothedAcceleration or Vector3.zero
+    end
+
+    if dt > MAX_SAMPLE_DT then
+        state.lastVelocity = targetVel
+        state.lastTime = currentTime
+        state.smoothedAcceleration = Vector3.zero
+        return Vector3.zero
+    end
+
+    state.lastVelocity = targetVel
+    state.lastTime = currentTime
+
+    local rawAcceleration = (targetVel - previousVelocity) / dt
+    local smoothing = 0.15
+    state.smoothedAcceleration = (state.smoothedAcceleration or Vector3.zero):Lerp(rawAcceleration, smoothing)
+
+    return state.smoothedAcceleration
+end
+
+local function safeUnit(v3)
+    local mag = v3.Magnitude
+    if mag <= 1e-6 then return nil end
+    return v3 / mag
+end
+
+local function solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec)
+    if typeof(bulletSpeed) ~= "number" or bulletSpeed <= 0 then return nil end
+    if typeof(shooterPos) ~= "Vector3" then return nil end
+    if typeof(bulletGravityVec) ~= "Vector3" then return nil end
+    if not targetPart or not targetPart:IsA("BasePart") then return nil end
+
+    local currentTime = os.clock()
+    local targetPos = targetPart.Position
+    local targetVel = targetPart.AssemblyLinearVelocity
+    local pingOffset = State.PingCompensation and (getPing() * 0.5) or 0
+    local targetAcc = getTargetAcceleration(targetPart, targetVel, currentTime)
+
+    local function f(t)
+        local totalT = t + pingOffset
+        local targetAtT = targetPos + (targetVel * totalT) + (0.5 * targetAcc * (totalT ^ 2))
+        local bulletDropAtT = 0.5 * bulletGravityVec * (t ^ 2)
+        local requiredDisplacement = targetAtT - shooterPos - bulletDropAtT
+        return (bulletSpeed * t) - requiredDisplacement.Magnitude
+    end
+
+    local t0 = 0
+    local initialDist = (targetPos - shooterPos).Magnitude
+    local t1 = (initialDist / bulletSpeed) + pingOffset
+
+    if t1 <= 0 then return safeUnit(targetPos - shooterPos) end
+
+    local f0 = f(t0)
+    local f1 = f(t1)
+    local t_intercept = t1
+    local tolerance = 0.001
+    local maxIterations = 8
+
+    for i = 1, maxIterations do
+        if math.abs(f1 - f0) < 1e-6 then break end
+        local next_t = t1 - f1 * (t1 - t0) / (f1 - f0)
+        if next_t ~= next_t or next_t == math.huge or next_t == -math.huge then
+            t_intercept = t1
+            break
+        end
+        t_intercept = math.clamp(next_t, 0, MAX_PREDICTION_TIME)
+        if math.abs(t_intercept - t1) < tolerance then break end
+        t0, f0 = t1, f1
+        t1 = t_intercept
+        f1 = f(t1)
+    end
+
+    local state = TargetStates[targetPart]
+    if state then
+        local prevPredictionTime = state.lastPredictionTime or t_intercept
+        local maxChangePerFrame = 0.02
+        t_intercept = prevPredictionTime + math.clamp(t_intercept - prevPredictionTime, -maxChangePerFrame, maxChangePerFrame)
+        state.lastPredictionTime = t_intercept
+    end
+
+    local finalT = t_intercept + pingOffset
+    local finalTargetPos = targetPos + (targetVel * finalT) + (0.5 * targetAcc * (finalT ^ 2))
+    local displacement = finalTargetPos - shooterPos
+
+    if t_intercept > 0 then
+        local requiredVelocity = (displacement / t_intercept) - (0.5 * bulletGravityVec * t_intercept)
+        local finalUnit = safeUnit(requiredVelocity)
+        if finalUnit then return finalUnit end
+    end
+
+    return safeUnit(displacement)
+end
+
+local function getPredictedPosition(targetPart, rootPart)
+    local targetPos = targetPart.Position
+    if not State.Prediction then return targetPos end
+
+    local camera = getCamera()
+    if not camera then return targetPos end
+
+    local shooterPos = camera.CFrame.Position
+    local bulletSpeed = math.max(WeaponService.Speed, 1)
+    local bulletGravityVec = Vector3.new(0, -WeaponService.Gravity, 0)
+
+    local aimDirection = solveInterceptVector(shooterPos, targetPart, bulletSpeed, bulletGravityVec)
+    if aimDirection then return shooterPos + (aimDirection * 10000) end
+
+    return targetPos
+end
+
+-- ==========================================
+-- 6.5 SILENT AIM ENGINE (namecall hook)
+-- ==========================================
+-- One __namecall hook covers all three paths:
+--   "Raycast"/"FindPartOnRay" -> steer the game's own ballistic ray at the
+--     predicted point, solved from the ray's real origin (muzzle), killing
+--     the parallax error a camera-rotating aimbot can never fix.
+--   "FireServer" -> rewrite direction-shaped args (Vector3) and muzzle-shaped
+--     CFrames for remote-validated guns (ACS 1.x style). Game-specific: verify
+--     remote arg layout per game; this heuristic covers the common layouts.
+-- Guards: checkcaller() keeps OUR rays (ESP/visibility) untouched;
+-- getcallingscript() restricts redirects to Tool scripts only.
+local SilentAim = {
+    Hooked = false,
+    OriginalNamecall = nil
+}
+
+function SilentAim:GetAimDirection(origin)
+    local part = TargetService.TargetPart
+    if not (part and part.Parent) then return nil end
+
+    if not State.Prediction then
+        local d = part.Position - origin
+        return d.Magnitude > 1e-6 and d.Unit or nil
+    end
+
+    return solveInterceptVector(
+        origin,
+        part,
+        math.max(WeaponService.Speed, 1),
+        Vector3.new(0, -WeaponService.Gravity, 0)
+    )
+end
+
+function SilentAim:CallerIsGunScript()
+    local ok, caller = pcall(getcallingscript)
+    if not ok or typeof(caller) ~= "Instance" then return false end
+    return caller:FindFirstAncestorOfClass("Tool") ~= nil
+end
+
+function SilentAim:Install()
+    if self.Hooked then return end
+    self.Hooked = true
+
+    self.OriginalNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+
+        if State.SilentAim and not checkcaller() then
+            -- ---- PATH A: steer ballistic rays --------------------------------
+            if State.SilentMethod == "Raycast" and (self == Workspace) then
+                if method == "Raycast" then
+                    local args = table.pack(...)
+                    local origin, dir = args[1], args[2]
+                    if typeof(origin) == "Vector3" and typeof(dir) == "Vector3"
+                        and dir.Magnitude > 1e-6 and SilentAim:CallerIsGunScript() then
+                        local aimDir = SilentAim:GetAimDirection(origin)
+                        if aimDir then
+                            args[2] = aimDir * dir.Magnitude -- preserve ray length
+                            return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
+                        end
+                    end
+                elseif method == "FindPartOnRay" then
+                    local args = table.pack(...)
+                    local ray = args[1]
+                    if typeof(ray) == "Ray" and ray.Direction.Magnitude > 1e-6
+                        and SilentAim:CallerIsGunScript() then
+                        local aimDir = SilentAim:GetAimDirection(ray.Origin)
+                        if aimDir then
+                            args[1] = Ray.new(ray.Origin, aimDir * ray.Direction.Magnitude)
+                            return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
+                        end
+                    end
+                end
+
+            -- ---- PATH B: rewrite FireServer args (remote-validated guns) ------
+            elseif State.SilentMethod == "Remote" and method == "FireServer" then
+                local part = TargetService.TargetPart
+                if part and part.Parent and SilentAim:CallerIsGunScript() then
+                    local camera = getCamera()
+                    if camera then
+                        local origin = camera.CFrame.Position
+                        local aimDir = SilentAim:GetAimDirection(origin)
+                            or camera.CFrame.LookVector
+                        local args = table.pack(...)
+                        for i = 1, args.n do
+                            local a = args[i]
+                            local t = typeof(a)
+                            if t == "Vector3" then
+                                -- Direction-shaped arg: near-unit vector, not a position.
+                                local mag = a.Magnitude
+                                if mag > 1e-6 and mag < 10 then args[i] = aimDir end
+                            elseif t == "CFrame" then
+                                -- Muzzle-shaped arg: sits near the camera, gets re-aimed.
+                                if (a.Position - origin).Magnitude < 5 then
+                                    args[i] = CFrame.lookAt(a.Position, a.Position + aimDir)
+                                end
+                            end
+                        end
+                        return SilentAim.OriginalNamecall(self, table.unpack(args, 1, args.n))
+                    end
+                end
+            end
+        end
+
+        return SilentAim.OriginalNamecall(self, ...)
+    end))
+end
+
+function SilentAim:Uninstall()
+    if not self.Hooked then return end
+    self.Hooked = false
+    -- Restore the original namecall so the game runs clean after unload.
+    if self.OriginalNamecall then
+        pcall(function() hookmetamethod(game, "__namecall", self.OriginalNamecall) end)
+        self.OriginalNamecall = nil
+    end
+end
+
+CleanupManager:AddCustomCleanup(function() SilentAim:Uninstall() end)
+SilentAim:Install()
+
+-- ==========================================
+-- 7. ESP SERVICE (30Hz, cached part refs)
+-- ==========================================
+local ESPService = {
+    Cache = {},
+    COLOR_VISIBLE = Color3.fromRGB(0, 255, 128),
+    COLOR_OBSTRUCTED = Color3.fromRGB(255, 50, 50)
+}
+
+function ESPService:ClearAll()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player.Character then
+            local hl = player.Character:FindFirstChild("ESP_Highlight")
+            if hl then hl:Destroy() end
+            local nt = player.Character:FindFirstChild("ESP_NameTag")
+            if nt then nt:Destroy() end
+        end
+    end
+    table.clear(self.Cache)
+end
+CleanupManager:AddCustomCleanup(function() ESPService:ClearAll() end)
+
+CleanupManager:AddConn("PlayerRemovingESP", Players.PlayerRemoving:Connect(function(player)
+    ESPService.Cache[player] = nil
+end))
+
+function ESPService:ProcessESP()
+    local now = tick()
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local isEnemy = isValidEnemy(player)
+            local char = player.Character
+
+            local cached = self.Cache[player]
+            -- [PERF] Cached refs instead of FindFirstChild per player per tick.
+            local highlight = cached and cached.Highlight
+            if highlight and highlight.Parent ~= char then highlight = nil end
+            local nameTag = cached and cached.NameTag
+            if nameTag and nameTag.Parent ~= char then nameTag = nil end
+
+            if (not State.ESP and not State.ESPName) or not isEnemy then
+                if highlight then highlight:Destroy() end
+                if nameTag then nameTag:Destroy() end
+                if cached then cached.Highlight, cached.NameTag = nil, nil end
+                continue
+            end
+
+            if not cached or cached.Character ~= char or (now - cached.LastCheck > 0.35) then
+                self.Cache[player] = {
+                    Character = char,
+                    Visible = VisibilityService:CheckVisibility(char, 5),
+                    LastCheck = now,
+                    Highlight = highlight,
+                    NameTag = nameTag
+                }
+                cached = self.Cache[player]
+            end
+
+            local visible = cached.Visible
+            local currentColor = visible and self.COLOR_VISIBLE or self.COLOR_OBSTRUCTED
+
+            if State.ESP then
+                if not highlight then
+                    highlight = Instance.new("Highlight")
+                    highlight.Name = "ESP_Highlight"
+                    highlight.FillTransparency = 0.25
+                    highlight.Parent = char
+                    cached.Highlight = highlight
+                end
+                highlight.FillColor = currentColor
+                highlight.OutlineColor = visible and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(100, 0, 0)
+            elseif highlight then
+                highlight:Destroy()
+                cached.Highlight = nil
+            end
+
+            if State.ESPName then
+                local head = char:FindFirstChild("Head")
+                if head then
+                    if not nameTag then
+                        nameTag = Instance.new("BillboardGui")
+                        nameTag.Name = "ESP_NameTag"
+                        nameTag.Adornee = head
+                        nameTag.Size = UDim2.new(0, 150, 0, 30)
+                        nameTag.StudsOffset = Vector3.new(0, 2, 0)
+                        nameTag.AlwaysOnTop = true
+                        nameTag.Parent = char
+                        cached.NameTag = nameTag
+
+                        local textLabel = Instance.new("TextLabel")
+                        textLabel.Name = "TagLabel"
+                        textLabel.Size = UDim2.new(1, 0, 1, 0)
+                        textLabel.BackgroundTransparency = 1
+                        textLabel.Text = player.Name
+                        textLabel.TextStrokeTransparency = 0
+                        textLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                        textLabel.Font = Enum.Font.SourceSansBold
+                        textLabel.TextSize = 14
+                        textLabel.Parent = nameTag
+                    end
+                    nameTag.TagLabel.TextColor3 = currentColor
+                end
+            elseif nameTag then
+                nameTag:Destroy()
+                cached.NameTag = nil
+            end
+        end
+    end
+end
+
+local espAccumulator = 0
+local ESP_INTERVAL = 1 / 30
+CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt)
+    if not State.ESP and not State.ESPName then return end
+    espAccumulator = espAccumulator + dt
+    if espAccumulator >= ESP_INTERVAL then
+        espAccumulator = 0
+        ESPService:ProcessESP()
+    end
+end))
+
+-- ==========================================
+-- 8. MAIN CAMERA ENGINE
+-- ==========================================
+-- Drawing lib exists in all mainstream executors; guard keeps partial
+-- environments (custom sandboxes) from dying at load over a cosmetic circle.
+local okDrawing, FOVCircle = pcall(Drawing.new, "Circle")
+if okDrawing and FOVCircle then
+    FOVCircle.Thickness = 1.5
+    FOVCircle.Color = Color3.fromRGB(255, 255, 255)
+    FOVCircle.Filled = false
+    FOVCircle.Transparency = 0.7
+    CleanupManager:AddDrawing("FOVCircle", FOVCircle)
+else
+    FOVCircle = nil
+end
+
+local function hasActiveWeapon()
+    local character = LocalPlayer.Character
+    if not character then return false end
+    local tool = character:FindFirstChildOfClass("Tool")
+    return tool ~= nil
+end
+
+CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(deltaTime)
+    local camera = getCamera()
+    if not camera then return end
+
+    local screenCenter = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+    if FOVCircle then
+        FOVCircle.Position = screenCenter
+        FOVCircle.Radius = scaleFov(State.FOV)
+        FOVCircle.Visible = State.ShowFOV
+    end
+
+    -- [RESTRUCTURE] One shared target pipeline feeds both modes: silent aim
+    -- acquires targets while the camera stays free; camera-rotation only
+    -- applies when State.Aimbot is on.
+    local needTarget = State.Aimbot or State.SilentAim
+    if not needTarget or not hasActiveWeapon() then
+        TargetService:ReleaseTarget()
+        return
+    end
+
+    if TargetService.CurrentTarget then
+        if not TargetService:KeepTarget(camera, screenCenter) then
+            TargetService:ReleaseTarget()
+        end
+    end
+
+    if not TargetService.CurrentTarget then
+        TargetService:AcquireTarget(camera, screenCenter)
+    end
+
+    if State.Aimbot and TargetService.CurrentTarget and TargetService.TargetPart then
+        local targetPos = getPredictedPosition(TargetService.TargetPart, TargetService.CurrentTarget.Character:FindFirstChild("HumanoidRootPart"))
+        local desiredDirection = (targetPos - camera.CFrame.Position).Unit
+        local lerpSpeed = math.clamp(State.Smoothness * 35, 1, 60)
+        local alpha = 1 - math.exp(-lerpSpeed * deltaTime)
+
+        -- [FIX 4] Rotate via CFrame:Lerp (slerp on the rotation) instead of
+        -- lerping LookVector, which distorts aim when pitched near +/-90deg.
+        local targetCF = CFrame.lookAt(camera.CFrame.Position, camera.CFrame.Position + desiredDirection)
+        camera.CFrame = camera.CFrame:Lerp(targetCF, alpha)
+    end
+end))
+
+-- ==========================================
+-- 9. UI CONSTRUCTION
+-- ==========================================
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "SnyX_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+CleanupManager:AddInstance("MainUI", ScreenGui)
+
+local ToggleBtn = Instance.new("TextButton")
+ToggleBtn.Size = UDim2.new(0, 45, 0, 45)
+ToggleBtn.Position = UDim2.new(0.03, 0, 0.2, 0)
+ToggleBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 25)
+ToggleBtn.Text = "SnyX"
+ToggleBtn.TextColor3 = Color3.fromRGB(180, 0, 255)
+ToggleBtn.Font = Enum.Font.SourceSansBold
+ToggleBtn.TextSize = 14
+ToggleBtn.Active = true
+ToggleBtn.Draggable = true
+ToggleBtn.Parent = ScreenGui
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 8)
+btnCorner.Parent = ToggleBtn
+
+local btnStroke = Instance.new("UIStroke")
+btnStroke.Color = Color3.fromRGB(180, 0, 255)
+btnStroke.Thickness = 1.5
+btnStroke.Parent = ToggleBtn
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0, 290, 0, 380)
+MainFrame.Position = UDim2.new(0.15, 0, 0.25, 0)
+MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+MainFrame.Active = true
+MainFrame.Draggable = true
+MainFrame.Visible = false
+MainFrame.Parent = ScreenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 8)
+mainCorner.Parent = MainFrame
+
+local mainStroke = Instance.new("UIStroke")
+mainStroke.Color = Color3.fromRGB(45, 45, 45)
+mainStroke.Parent = MainFrame
+
+ToggleBtn.MouseButton1Click:Connect(function()
+    MainFrame.Visible = not MainFrame.Visible
+end)
+
+local TitleBar = Instance.new("TextLabel")
+TitleBar.Size = UDim2.new(1, 0, 0, 35)
+TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+TitleBar.Text = "  SNYX ADVANCED SYSTEM"
+TitleBar.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleBar.Font = Enum.Font.SourceSansBold
+TitleBar.TextSize = 14
+TitleBar.TextXAlignment = Enum.TextXAlignment.Left
+TitleBar.Parent = MainFrame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 8)
+titleCorner.Parent = TitleBar
+
+local ScrollFrame = Instance.new("ScrollingFrame")
+ScrollFrame.Size = UDim2.new(1, -10, 1, -45)
+ScrollFrame.Position = UDim2.new(0, 5, 0, 40)
+ScrollFrame.BackgroundTransparency = 1
+ScrollFrame.ScrollBarThickness = 3
+ScrollFrame.Parent = MainFrame
+
+local UIList = Instance.new("UIListLayout")
+UIList.Padding = UDim.new(0, 6)
+UIList.SortOrder = Enum.SortOrder.LayoutOrder
+UIList.Parent = ScrollFrame
+UIList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    ScrollFrame.CanvasSize = UDim2.new(0, 0, 0, UIList.AbsoluteContentSize.Y + 10)
+end)
+
+local currentLayoutOrder = 0
+
+-- [FIX 3] Step-aware formatting: no more 0.30000000000000004 in the value label.
+local function formatSliderValue(v, step)
+    if step >= 1 then return tostring(math.floor(v + 0.5)) end
+    return string.format("%.2f", v)
+end
+
+local function createToggle(text, initialState, callback)
+    currentLayoutOrder = currentLayoutOrder + 1
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 32)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    frame.LayoutOrder = currentLayoutOrder
+    frame.Parent = ScrollFrame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.7, -10, 1, 0)
+    label.Position = UDim2.new(0.04, 0, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.SourceSans
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 48, 0, 20)
+    btn.Position = UDim2.new(1, -54, 0.5, -10)
+    btn.BackgroundColor3 = initialState and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+    btn.Text = initialState and "ON" or "OFF"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 11
+    btn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+
+    local isToggled = initialState
+    btn.MouseButton1Click:Connect(function()
+        isToggled = not isToggled
+        btn.Text = isToggled and "ON" or "OFF"
+        btn.BackgroundColor3 = isToggled and Color3.fromRGB(50, 150, 50) or Color3.fromRGB(150, 50, 50)
+        callback(isToggled)
+    end)
+end
+
+local function createModeSelector(text, modesArray, initialIndex, callback)
+    currentLayoutOrder = currentLayoutOrder + 1
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 32)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    frame.LayoutOrder = currentLayoutOrder
+    frame.Parent = ScrollFrame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, -10, 1, 0)
+    label.Position = UDim2.new(0.04, 0, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.SourceSans
+    label.TextSize = 12
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 80, 0, 20)
+    btn.Position = UDim2.new(1, -86, 0.5, -10)
+    btn.BackgroundColor3 = Color3.fromRGB(50, 100, 150)
+    btn.Text = modesArray[initialIndex]
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextSize = 11
+    btn.Parent = frame
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+
+    local currentIndex = initialIndex
+    btn.MouseButton1Click:Connect(function()
+        currentIndex = currentIndex + 1
+        if currentIndex > #modesArray then currentIndex = 1 end
+        btn.Text = modesArray[currentIndex]
+        callback(modesArray[currentIndex])
+    end)
+end
+
+local function createSlider(text, min, max, default, step, callback)
+    currentLayoutOrder = currentLayoutOrder + 1
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 48)
+    frame.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+    frame.LayoutOrder = currentLayoutOrder
+    frame.Parent = ScrollFrame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 6)
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.6, 0, 0, 20)
+    label.Position = UDim2.new(0.04, 0, 0, 3)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.fromRGB(220, 220, 220)
+    label.Font = Enum.Font.SourceSans
+    label.TextSize = 11
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local valLabel = Instance.new("TextLabel")
+    valLabel.Size = UDim2.new(0.3, 0, 0, 20)
+    valLabel.Position = UDim2.new(0.65, 0, 0, 3)
+    valLabel.BackgroundTransparency = 1
+    valLabel.Text = formatSliderValue(default, step)
+    valLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    valLabel.Font = Enum.Font.SourceSansBold
+    valLabel.TextSize = 11
+    valLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valLabel.Parent = frame
+
+    local sliderBar = Instance.new("TextButton")
+    sliderBar.Size = UDim2.new(0.92, 0, 0, 6)
+    sliderBar.Position = UDim2.new(0.04, 0, 0, 30)
+    sliderBar.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    sliderBar.Text = ""
+    sliderBar.AutoButtonColor = false
+    sliderBar.Parent = frame
+
+    local barCorner = Instance.new("UICorner")
+    barCorner.CornerRadius = UDim.new(0, 3)
+    barCorner.Parent = sliderBar
+
+    local sliderFill = Instance.new("Frame")
+    local initialRatio = math.clamp((default - min) / (max - min), 0, 1)
+    sliderFill.Size = UDim2.new(initialRatio, 0, 1, 0)
+    sliderFill.BackgroundColor3 = Color3.fromRGB(180, 0, 255)
+    sliderFill.BorderSizePixel = 0
+    sliderFill.Parent = sliderBar
+
+    local fillCorner = Instance.new("UICorner")
+    fillCorner.CornerRadius = UDim.new(0, 3)
+    fillCorner.Parent = sliderFill
+
+    local dragging = false
+    sliderBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            local function update(inp)
+                local ratio = math.clamp((inp.Position.X - sliderBar.AbsolutePosition.X) / sliderBar.AbsoluteSize.X, 0, 1)
+                local stepped = math.floor((min + (ratio * (max - min))) / step + 0.5) * step
+                stepped = math.clamp(stepped, min, max)
+                sliderFill.Size = UDim2.new((stepped - min) / (max - min), 0, 1, 0)
+                valLabel.Text = formatSliderValue(stepped, step)
+                callback(stepped)
+            end
+            update(input)
+            local moveConn, relConn
+            moveConn = UserInputService.InputChanged:Connect(function(moveInp)
+                if dragging and (moveInp.UserInputType == Enum.UserInputType.MouseMovement or moveInp.UserInputType == Enum.UserInputType.Touch) then
+                    update(moveInp)
+                end
+            end)
+            relConn = UserInputService.InputEnded:Connect(function(relInp)
+                if relInp.UserInputType == Enum.UserInputType.MouseButton1 or relInp.UserInputType == Enum.UserInputType.Touch then
+                    dragging = false
+                    moveConn:Disconnect()
+                    relConn:Disconnect()
+                end
+            end)
+        end
+    end)
+end
+
+createToggle("Enable Aimbot", State.Aimbot, function(v) State.Aimbot = v end)
+createToggle("Silent Aim", State.SilentAim, function(v) State.SilentAim = v end)
+createModeSelector("Silent Method", {"Raycast", "Remote"}, 1, function(v) State.SilentMethod = v end)
+createModeSelector("Target Part", {"Head", "Torso", "Random"}, 1, function(v) State.TargetPartMode = v end)
+createToggle("Show FOV Circle", State.ShowFOV, function(v) State.ShowFOV = v end)
+createToggle("Team Check", State.TeamCheck, function(v) State.TeamCheck = v end)
+createToggle("Wall Check", State.WallCheck, function(v) State.WallCheck = v end)
+
+createToggle("Prediction Engine", State.Prediction, function(v) State.Prediction = v end)
+createToggle("Ping Compensation", State.PingCompensation, function(v) State.PingCompensation = v end)
+
+createToggle("Drop Value Mode: Multiplier", State.DropIsMultiplier, function(v)
+    State.DropIsMultiplier = v
+    WeaponService:UpdateAuto()
+end)
+
+createToggle("Auto Weapon Speed", State.AutoBulletSpeed, function(v)
+    State.AutoBulletSpeed = v
+    WeaponService:UpdateAuto()
+end)
+
+createToggle("ESP Wallhack", State.ESP, function(v) State.ESP = v end)
+createToggle("ESP Username", State.ESPName, function(v) State.ESPName = v end)
+
+createSlider("Manual Bullet Speed", 500, 10000, State.BulletSpeed, 100, function(v)
+    State.BulletSpeed = v
+    WeaponService:UpdateManual()
+end)
+createSlider("Manual Gravity", 0, 500, State.BulletGravity, 10, function(v)
+    State.BulletGravity = v
+    WeaponService:UpdateManual()
+end)
+createSlider("Smoothness", 0.05, 1, State.Smoothness, 0.05, function(v) State.Smoothness = v end)
+createSlider("Aimbot FOV Range", 50, 500, State.FOV, 10, function(v) State.FOV = v end)
