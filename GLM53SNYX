@@ -1,6 +1,10 @@
--- Luau | snyx_aimbot_v2_7.lua | Roblox executor (Synapse-style env)
+-- Luau | snyx_aimbot_v2_10.lua | Roblox executor (Synapse-style env)
 -- =====================================================================
--- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.7 — INSTANT LOCK + FREE SWITCH)
+-- SNYX ADVANCED PREDICTION AIMBOT & ESP (v2.10 — TRIGGER WALL CHECK)
+-- - แก้เกมตัดดับปิดเองตอนหันเข้าเป้า: trigger bot เดิมเช็ค "ผู้เล่นกดเอง" ด้วย
+--   IsMouseButtonPressed — แต่มันเห็นคลิกสังเคราะห์ของตัวเองด้วย → กด → เฟรมถัดไปคิดว่า
+--   คนเล่นกด → ปล่อย → คิดว่าว่าง → กดใหม่ … วนรัวกด/ปล่อยทุกเฟรมตั้งแต่เข้าเป้าครั้งแรก
+--   = input bridge โดนถล่มหนัก = เกมปิดเอง — แก้ด้วย flag triggerHeld (รู้ตัวเองว่ากดอยู่)
 -- - ล็อคไวขึ้น: acquire ทุกเฟรมตอนว่าง (เดิม 30Hz) / แรม snap ถึงชุดเต็มที่ 0.85×SnapAngle
 --   / เพดาน speed ยกขึ้น / พักหลังสะบัด 0.12→0.10s — สะบัดจบ = ล็อคเป้าใหม่ทันที
 -- - สลับเป้าไม่ติดเหนียว: วัดสะบัดจาก "การหมุนของมือผู้เล่นล้วน" (แก้จุดอ่อน v2.6 — ตอน
@@ -8,6 +12,20 @@
 --   ปัดต่อ = ต่ออายุปล่อยอัตโนมัติ, คูลดาวน์ 0.3s ไม่ดูดกลับเป้าเดิม,
 --   Free Steer = ลากหนีเป้าแล้วกล้องผ่อนตามมือ (ลากค้าง ~0.2s = ปล่อยล็อคให้สลับเอง)
 -- - ไม่กระตุกตอนสลับ: ล็อคใหม่ไกล่เข้าเป้า ~100ms — ไวแต่ไม่เทเลพอร์ท
+-- - Trigger input ปลอดภัย 2 ชั้น: VirtualUser (input ระดับ engine ไม่แตะ bridge ผู้เช่า)
+--   ก่อน / mouse1press สำรอง — ทุก call มี pcall + ปล่อยคลิกคู่กันเสมอ + เว้นจังหวะคลิก
+--   + รอจุดเล็งนิ่ง (ไม่ snap/ไกล่/สะบัด) ค่อยกด = จังหวะยิงธรรมชาติ
+-- - กำแพงกัน NaN/Inf: ตัวเลขพังจาก replication ไม่มีทางลอดไปถึง camera CFrame
+--   (safeUnit กรองเวกเตอร์พัง / velocity บ้าคลั่ง = ทิ้ง + รีเซ็ต EMA / เขียนกล้องผ่าน pcall)
+-- - Trigger ไม่ยิงทะลุวัตถุขวาง: มี wall check ของตัวเอง (Trigger Wall Check, default ON)
+--   เดิมยืมเงื่อนไข Wall Check ของ aimbot (default OFF) → ตอนล็อคทะลุกำแพง/เป้าเพิ่ง
+--   หลบหลังกล่อง (aimbot กุม grace ไว้) จุดเล็งยังอยู่ในมุม = ยิงใส่กำแพง — ตอนนี้เช็ค
+--   เส้นสายตาทุกครั้งก่อนกด (ทะลุพุ่มไม้/กระจกใสได้เหมือนปืนจริง)
+-- - Trigger Bot: ยิงเองเมื่อจุดเล็งเข้าศัตรู — ดีเลย์จำลอง reaction time (จิตเตอร์ ±15%),
+--   กดค้างตราบใดที่ยังบนเป้า (auto ยิงต่อเนื่อง / semi หนึ่งคลิก), ผู้เล่นกดเอง = ถอนมือ,
+--   สะบัดจอ = หยุดยิงระหว่างสะบัด, ทำงานได้ทั้งตอนล็อค (เช็คมุมคลาด) และสแตนด์อโลน (ray กลางจอ)
+-- - [v2.8] Trigger Bot — ยิงเองเมื่อจุดเล็งเข้าเป้า
+-- - [v2.7] ล็อคไวขึ้น + สลับเป้าไม่ติดเหนียว + free steer + switch ease
 -- - [v2.6] hysteresis วงเก็บ 1.35× / grace 0.25s / velocity+zoom EMA / hitch guard
 -- - [v2.4] Zoom-aware ทุกตัวคุม / Lag Comp อยู่ในตัว solve
 -- =====================================================================
@@ -82,13 +100,18 @@ local State = {
         PredMaxSlew = 3.0,    -- [v2.1] เพดานเปลี่ยน intercept time (วินาทีต่อวินาที)
         TrackBoost = 1.5,     -- [v2.2] แรงเร่งตามเมื่อคลาดเป้า (0 = ปิด, 3 = วิ่งสุดตัว)
         LagComp = true,       -- [v2.2] ชดเชย lag ของ smoothing ด้วยการเล็งนำหน้าตามความเร็วเป้า
-        SnapAngle = 20,       -- [v2.5] มุมคลาด (องศา, สเกลตามซูม) ที่ snap ล็อคทันที (0 = ปิด)
+        SnapAngle = 5,       -- [v2.5] มุมคลาด (องศา, สเกลตามซูม) ที่ snap ล็อคทันที (0 = ปิด)
         DragSwitch = true,    -- [v2.5] สะบัดจอเพื่อสลับเป้า — พักเล็งชั่วคราวให้กล้องตามมือผู้เล่น
-        FlickSpeed = 140,     -- [v2.7] ความเร็วปัด (°/s) ที่นับเป็น "สะบัดสลับเป้า" — ต่ำ = ไวต่อปัดเบา ๆ
+        FlickSpeed = 120,     -- [v2.7] ความเร็วปัด (°/s) ที่นับเป็น "สะบัดสลับเป้า" — ต่ำ = ไวต่อปัดเบา ๆ
         FreeSteer = true,     -- [v2.7] ลากหนีเป้า = กล้องผ่อนแรงดึงตามมือ ไม่ตีค้อน (ไม่เหนียว)
+        TriggerBot = true,    -- [v2.8] ยิงอัตโนมัติเมื่อจุดเล็งเข้าศัตรู (ปิดได้ที่เมนู)
+        TriggerSafeInput = true, -- [v2.9] ยิงผ่าน VirtualUser (input ระดับ engine เสถียรสุด) ก่อน — ปิด = ใช้ mouse1press ตรง ๆ
+        TriggerWallCheck = true, -- [v2.10] ไม่ยิงถ้ามีวัตถุขวางกั้นเส้นสายตา (แยกจาก Wall Check ของ aimbot)
+        TriggerDelay = 90,    -- [v2.8] ดีเลย์จำลอง reaction time (ms) — 0 = ไวสุด, ~90 = ธรรมชาติ
+        TriggerAngle = 0.7,   -- [v2.8] มุมคลาด (องศา) ที่ถือว่า "เข้าเลนส์" ตอนล็อคเป้าอยู่
         TargetPartMode = "Head",
-        PingCompensation = false,
-        DropIsMultiplier = false,
+        PingCompensation = true,
+        DropIsMultiplier = true,
         AutoBulletSpeed = true,
         BulletSpeed = 5000,
         BulletGravity = workspace.Gravity,
@@ -96,7 +119,7 @@ local State = {
         FOV = 100,
         ShowFOV = false,
         ESP = true,
-        ESPName = false
+        ESPName = true
 }
 
 local function getCamera() return Workspace.CurrentCamera end
@@ -118,10 +141,23 @@ end
 -- ==========================================
 -- 3. MATH HELPERS
 -- ==========================================
+-- [v2.9] เวกเตอร์ "มีตัวเลขจริง" ทุกแกน (ไม่ใช่ NaN/Inf) — ตัวเลขพังจาก replication
+-- ถ้าลอดไปถึง camera CFrame = เรนเดอร์คำนวณพังทั้งระบบ เกมล้มได้ — ใช้เป็นด่านแรกของทุกเส้นทาง
+local function isFiniteVec3(v)
+        if typeof(v) ~= "Vector3" then return false end
+        local x, y, z = v.X, v.Y, v.Z
+        if x ~= x or y ~= y or z ~= z then return false end -- NaN ≠ NaN
+        return x < math.huge and x > -math.huge
+                and y < math.huge and y > -math.huge
+                and z < math.huge and z > -math.huge
+end
+
 local function safeUnit(v3)
+        if not isFiniteVec3(v3) then return nil end -- [v2.9] เดิม NaN/Inf ลอดผ่าน (NaN <= 1e-6 เป็น false)
         local mag = v3.Magnitude
-        if mag <= 1e-6 then return nil end
-        return v3 / mag
+        if not (mag > 1e-6 and mag < math.huge) then return nil end
+        local unit = v3 / mag
+        return isFiniteVec3(unit) and unit or nil
 end
 -- ==========================================
 -- 4. WEAPON SERVICE (Cached Weapon Stats)
@@ -474,8 +510,9 @@ local MAX_DV_PER_SAMPLE = 35   -- Δv ต่อตัวอย่างที่
 local SPIKE_COOLDOWN = 0.15    -- เจอ spike แล้วเชื่อ accel = 0 ช่วงสั้น ๆ (velocity ยังใช้จริงตามเดิม)
 local MAX_ACCEL = 200          -- เพดาน |accel| ที่ป้อนเข้าสมการ (humanoid จริงแทบไม่เกินนี้)
 local ACCEL_TAU_BASE = 0.10    -- τ ฐานของ EMA — หารด้วย PredReactivity (เร็วขึ้นไม่ผ่าน noise เฟรมเดียว)
-local MAX_ACCEL_LEAD = 12      -- เพดานระยะ lead ที่มาจาก accel เทเท่านั้น (กัน t ยาว × accel ค้าง = ปลิว)
+local MAX_ACCEL_LEAD = 12      -- เพดานระยะ lead ที่มาจาก accel เท่านั้น (กัน t ยาว × accel ค้าง = ปลิว)
 local VEL_TAU = 0.05           -- [v2.6-PERF] τ ของ EMA ความเร็ว — velocity replicated มาเป็นบันได ~20Hz
+local VELOCITY_SANITY = 3000   -- [v2.9] เพดาน |velocity| ที่เชื่อได้ — เกินนี้ = replication glitch/NaN ไม่กินในสมการ
                                -- (แตะพื้น/เปลี่ยนทิศ = Δv ทั้งก้าวในเฟรมเดียว) เกลี่ยแล้ว lead ไม่สะดุ้ง
 
 local function clampAccelLead(v3, cap)
@@ -513,6 +550,29 @@ end
 -- ชั้น 3: เพดาน |accel| ≤ MAX_ACCEL
 local function getTargetAcceleration(kinPart, targetVel, currentTime)
         local state = TargetStates[kinPart]
+
+        -- [v2.9] velocity พัง (NaN/Inf/บ้าคลั่งเกินกายภาพ) = ทิ้ง sample + ล้างพิษ EMA
+        -- (เดิมค่าพังค่าเดียวปนเข้า smoothedVelocity แล้วแช่ค้างตลอด → lead พังไปทุกเฟรม)
+        local velSane = isFiniteVec3(targetVel) and targetVel.Magnitude <= VELOCITY_SANITY
+        if not velSane then
+                if state then
+                        state.lastVelocity = isFiniteVec3(state.lastVelocity) and state.lastVelocity or Vector3.zero
+                        state.lastTime = currentTime
+                        state.smoothedAcceleration = Vector3.zero
+                        state.spikeUntil = currentTime + SPIKE_COOLDOWN
+                        state.lastPredictionTime = nil
+                        if not isFiniteVec3(state.smoothedVelocity) then
+                                state.smoothedVelocity = Vector3.zero
+                        end
+                end
+                local outVel = state and state.smoothedVelocity
+                return Vector3.zero, (isFiniteVec3(outVel) and outVel) or Vector3.zero
+        end
+        -- [v2.9] ล้างพิษย้อนหลัง (ถ้า state เก่าเคยกินค่าพังไว้ก่อนหน้า)
+        if state then
+                if not isFiniteVec3(state.smoothedVelocity) then state.smoothedVelocity = targetVel end
+                if not isFiniteVec3(state.smoothedAcceleration) then state.smoothedAcceleration = Vector3.zero end
+        end
 
         if not state then
                 TargetStates[kinPart] = {
@@ -681,7 +741,7 @@ local function getPredictedPosition(targetPart, shooterPos, deltaTime, leadTime,
                         local kinPart = getKinematicPart(targetPart)
                         if kinPart then
                                 local _, vel = getTargetAcceleration(kinPart, kinPart.AssemblyLinearVelocity, os.clock())
-                                if vel and vel.Magnitude > 1e-3 then
+                                if vel and vel.Magnitude > 1e-3 and vel.Magnitude <= VELOCITY_SANITY then
                                         targetPos += vel * leadTime
                                 end
                         end
@@ -855,6 +915,7 @@ CleanupManager:AddConn("ESP_Heartbeat", RunService.Heartbeat:Connect(function(dt
                 ESPService:ProcessESP()
         end
 end))
+
 -- ==========================================
 -- 9. MAIN CAMERA ENGINE
 -- ==========================================
@@ -869,6 +930,196 @@ CleanupManager:AddDrawing("FOVCircle", FOVCircle)
 local function hasActiveWeapon()
         local character = LocalPlayer and LocalPlayer.Character
         return character ~= nil and character:FindFirstChildOfClass("Tool") ~= nil
+end
+
+-- ==========================================
+-- 9.5 TRIGGER BOT (v2.8 — auto fire when crosshair on enemy)
+-- ==========================================
+local VirtualUser = game:GetService("VirtualUser")
+
+local TRIGGER_MIN_HOLD = 0.04      -- กดค้างขั้นต่ำ (วิ.) ให้ปืน semi-auto แคตช์คลิกทัน
+local TRIGGER_RELEASE_GRACE = 0.07 -- หลุดเป้านานเท่านี้ (วิ.) ค่อยปล่อยคลิก — ขอบเป้าไม่สะดุ้ง
+local TRIGGER_CYCLE_GAP = 0.12     -- [v2.9] เว้นช่วงขั้นต่ำระหว่างไซเคิลคลิก — จังหวะเป็นมนุษย์ ไม่รัวเกินกาย
+local TRIGGER_RAY_DIST = 2048
+
+local triggerRayParams = RaycastParams.new()
+triggerRayParams.FilterType = Enum.RaycastFilterType.Exclude
+triggerRayParams.IgnoreWater = true
+
+local triggerState = "idle"   -- idle → pending (เจอเป้า รอดีเลย์) → firing (กดค้าง)
+local triggerPendingAt = 0
+local triggerDelayUsed = 0
+local triggerFiredAt = 0
+local triggerOffSince = nil
+local triggerIdleSince = 0
+local triggerChannel = "vu"
+-- [v2.9] จำสถานะคลิกของตัวเอง — หัวใจของการแก้ "เกมปิดเองตอนเข้าเป้า":
+-- IsMouseButtonPressed ไม่รู้ว่าใครเป็นคนกด — คลิกสังเคราะห์ของเรามันเห็นเหมือนกัน
+-- เดิม: กด → เฟรมถัดไปคิดว่า "ผู้เล่นกดเอง" → ปล่อย → คิดว่าว่าง → กดใหม่ …
+-- วนกด/ปล่อยรัวทุกเฟรม = input bridge โดนถล่มหนัก = เกมตัดดับ — ต่อให้ flag นี้ไว้เสมอ
+local triggerHeld = false
+
+-- [v2.9] กด 2 ชั้น: Safe = VirtualUser ก่อน (input ระดับ engine เสถียรสุด — ไม่แตะ
+-- mouse bridge ของผู้เช่า) / ปิด Safe = mouse1press ตรง ๆ — ช่องไหนพังไปช่องถัดไป มี pcall ครบ
+local function fireInputDown()
+        local cam = getCamera()
+        local order = (State.TriggerSafeInput ~= false) and { "vu", "m1" } or { "m1", "vu" }
+        for _, ch in ipairs(order) do
+                local ok = false
+                if ch == "vu" and cam then
+                        ok = pcall(function()
+                                VirtualUser:CaptureController()
+                                VirtualUser:Button1Down(cam.ViewportSize * 0.5, cam.CFrame)
+                        end)
+                elseif ch == "m1" and type(mouse1press) == "function" then
+                        ok = pcall(mouse1press)
+                end
+                if ok then
+                        triggerChannel = ch
+                        return true
+                end
+        end
+        return false
+end
+
+-- ปล่อยต้องใช้ "ช่องเดียวกับที่กด" — กดช่อง m1 แต่ปล่อยช่อง vu = ปืนค้างยิงไม่หยุด
+local function fireInputUp()
+        local cam = getCamera()
+        if triggerChannel == "m1" and type(mouse1release) == "function" then
+                if pcall(mouse1release) then return true end
+        end
+        if cam then
+                return pcall(function()
+                        VirtualUser:Button1Up(cam.ViewportSize * 0.5, cam.CFrame)
+                end)
+        end
+        return false
+end
+
+local function triggerPress()
+        if fireInputDown() then
+                triggerHeld = true
+                return true
+        end
+        return false -- ทุกช่องทางพัง = อย่าเข้าสถานะ firing (กันคลิกค้างที่ปล่อยไม่ได้)
+end
+
+local function triggerRelease()
+        if triggerHeld then
+                fireInputUp()
+                triggerHeld = false
+        end
+end
+
+local function triggerReset()
+        triggerRelease()
+        triggerState = "idle"
+        triggerOffSince = nil
+        triggerIdleSince = os.clock()
+end
+
+-- กันเมาส์ค้าง: ถ้าสคริปต์ถูกล้าง/รีรันขณะคลิกค้าง ต้องปล่อยคลิกก่อน
+CleanupManager:AddCustomCleanup(function()
+        triggerRelease()
+        triggerState = "idle"
+end)
+
+-- หา "ศัตรูใต้จุดเล็ง" — 2 ทาง: ล็อคเป้าอยู่ = เช็คมุมคลาดของ part ที่ล็อค (ไวกว่า เพราะ
+-- aimbot กำลังดันจุดเล็งเข้าหาอยู่แล้ว) / ไม่ล็อค = ray กลางจอ (กำแพงตัดเอง ยิงทะลุไม่ได้)
+-- [v2.10] ทั้งสองทางยืนยันเส้นสายตาก่อนยิงเสมอ — เดิมฝั่งล็อคเช็คกำแพงด้วย
+-- State.WallCheck ของ aimbot (default OFF) = ยิงใส่กำแพงตอนล็อคทะลุ/เป้าเพิ่งหลบหลังบังเก็นได้
+local function findTriggerTarget(camera)
+        local shooterPos = camera.CFrame.Position
+        local look = camera.CFrame.LookVector
+
+        local targetPart = TargetService.TargetPart
+        if TargetService.CurrentTarget and targetPart and targetPart.Parent then
+                local toTarget = safeUnit(targetPart.Position - shooterPos)
+                if not toTarget then return nil end
+                local errDeg = math.deg(math.acos(math.clamp(look:Dot(toTarget), -1, 1)))
+                if errDeg > (State.TriggerAngle or 0.7) then return nil end
+                -- [v2.10] wall check ของ trigger เอง (default ON) — แยกจาก Wall Check ของ aimbot
+                -- เช็คเส้นสายตาถึงจุดเล็งจริงทุกเฟรมก่อนยิง; ทะลุพุ่มไม้/กระจกใสได้ (pierce 1 ชั้น)
+                if State.TriggerWallCheck ~= false and not VisibilityService:CheckVisibility(
+                        TargetService.CurrentTarget.Character, 1, targetPart) then
+                        return nil
+                end
+                return TargetService.CurrentTarget
+        end
+
+        local myChar = LocalPlayer and LocalPlayer.Character
+        local scratch = { camera }
+        if myChar then scratch[2] = myChar end
+        triggerRayParams.FilterDescendantsInstances = scratch
+        local hit = Workspace:Raycast(shooterPos, look * TRIGGER_RAY_DIST, triggerRayParams)
+        if not hit then return nil end
+
+        local node = hit.Instance
+        while node and node ~= Workspace do
+                if node:IsA("Model") and node:FindFirstChildOfClass("Humanoid") then
+                        local player = Players:GetPlayerFromCharacter(node)
+                        if player and isValidEnemy(player) then return player end
+                        return nil -- NPC/เพื่อน/ตัวไม่ใช่ศัตรู → ไม่ยิง
+                end
+                node = node.Parent
+        end
+        return nil
+end
+
+-- สเตตแมชชีน: เจอเป้า → รอดีเลย์ (reaction time + จิตเตอร์ ไม่หุ่น) → รอจุดเล็งนิ่ง → กด
+-- → ค้างตราบใดที่บนเป้า → ปล่อย (aimBusy = กล้องกำลัง snap/ไกล่/สะบัด — รอนิ่งก่อนค่อยกด)
+local function runTriggerBot(camera, aimBusy)
+        if not State.TriggerBot or not hasActiveWeapon() then
+                if triggerState ~= "idle" then triggerReset() end
+                return
+        end
+        -- ผู้เล่นกดยิงเองอยู่ (และเราไม่ได้เป็นคนกด) → ถอนมือ ไม่แย่งคลิก — [v2.9] กันสับสน
+        -- คลิกสังเคราะห์ของตัวเอง (จุดที่ทำให้ v2.8 เกมปิดเอง)
+        if not triggerHeld and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+                if triggerState ~= "idle" then triggerReset() end
+                return
+        end
+
+        local now = os.clock()
+        local onTarget = findTriggerTarget(camera) ~= nil
+
+        if triggerState == "idle" then
+                if onTarget and (now - triggerIdleSince) >= TRIGGER_CYCLE_GAP then
+                        triggerState = "pending"
+                        triggerPendingAt = now
+                        -- จิตเตอร์ ±15% สุ่มครั้งเดียวต่อการเข้าเป้า (ไม่ใช่ต่อเฟรม)
+                        local base = math.max((State.TriggerDelay or 90) / 1000, 0)
+                        triggerDelayUsed = base * (0.85 + math.random() * 0.3)
+                end
+        elseif triggerState == "pending" then
+                if not onTarget then
+                        triggerState = "idle" -- เป้าหลุดก่อนครบดีเลย์ → ยกเลิก
+                        triggerIdleSince = now
+                elseif now - triggerPendingAt >= triggerDelayUsed and not aimBusy then
+                        -- [v2.9] รอจุดเล็งนิ่งก่อนกด — คลิกกลางการ snap/ไกล่กล้อง = จังหวะแปลก
+                        -- (ทั้งเรื่อง anti-cheat อ่าน input และความนิ่งของเลนส์)
+                        if triggerPress() then
+                                triggerState = "firing"
+                                triggerFiredAt = now
+                        else
+                                triggerState = "idle" -- ยิงไม่ออกทุกช่องทาง → เริ่มไซเคิลใหม่
+                                triggerIdleSince = now
+                        end
+                end
+        else -- firing
+                if onTarget then
+                        triggerOffSince = nil
+                elseif not triggerOffSince then
+                        triggerOffSince = now
+                end
+                local offLong = triggerOffSince and (now - triggerOffSince) >= TRIGGER_RELEASE_GRACE
+                if offLong and (now - triggerFiredAt) >= TRIGGER_MIN_HOLD then
+                        triggerRelease()
+                        triggerState = "idle"
+                        triggerOffSince = nil
+                        triggerIdleSince = now
+                end
+        end
 end
 
 -- [v2.7] วัด "การหมุนที่มาจากมือผู้เล่น" ให้สะอาดจากอิทธิพลของเรา (แก้จุดอ่อน v2.6)
@@ -954,6 +1205,7 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                 steerInfluence = 1
                 steerHoldStart = nil
                 prevAimKey = nil
+                runTriggerBot(camera, false) -- [v2.8] triggerbot สแตนด์อโลนได้ (ไม่ต้องเปิด aimbot)
                 return
         end
 
@@ -969,6 +1221,7 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                 steerHoldStart = nil
                 prevErrDeg = nil
                 prevAimKey = nil -- [v2.7] re-lock หลังสะบัด = ได้ switch ease เสมอ (ไม่จุ๊บกลับ)
+                triggerReset() -- [v2.8] สะบัด = ยกเลิกการยิงอัตโนมัติระหว่างสะบัด
                 return
         end
 
@@ -1076,6 +1329,7 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                                         TargetService:ReleaseTarget()
                                         flickUntil = os.clock() + FLICK_HOLD
                                         prevAimKey = nil
+                                        triggerReset() -- [v2.8] ปล่อยล็อคแบบลากค้าง = หยุดยิงด้วย
                                         return
                                 end
                         else
@@ -1084,16 +1338,28 @@ CleanupManager:AddConn("RenderStep", RunService.RenderStepped:Connect(function(d
                         local infTarget = steering and STEER_MIN_INFLUENCE or 1
                         steerInfluence += (infTarget - steerInfluence) * (1 - math.exp(-deltaTime / STEER_TAU))
 
+                        -- [v2.9] ล็อคช่วงค่าก่อนผสมทิศ — ตัวเลขพังหลุดมาได้ก็ไม่ผสมลงกล้อง
+                        alpha = math.clamp(alpha, 0, 1)
+                        steerInfluence = math.clamp(steerInfluence, 0, 1)
                         local smoothDirection = safeUnit(camera.CFrame.LookVector:Lerp(desiredDirection, alpha * steerInfluence))
                         if smoothDirection then
-                                camera.CFrame = CFrame.lookAt(shooterPos, shooterPos + smoothDirection)
-                                lastWriteLook = smoothDirection -- [v2.7] baseline วัดการหมุนของผู้เล่น (ฐาน b)
+                                -- [v2.9] เขียนกล้องผ่าน pcall — CFrame.lookAt โยน error (ทิศ collinear กับ up ฯลฯ)
+                                -- = ข้ามเฟรมนั้นไป ไม่พังทั้ง render callback
+                                local ok, newCFrame = pcall(CFrame.lookAt, shooterPos, shooterPos + smoothDirection)
+                                if ok and newCFrame then
+                                        camera.CFrame = newCFrame
+                                        lastWriteLook = smoothDirection -- [v2.7] baseline วัดการหมุนของผู้เล่น (ฐาน b)
+                                end
                         end
                         prevErrDeg = errDeg
                 end
         end
-end))
 
+        -- [v2.8] Trigger Bot — วัดท้ายเฟรม: ใช้ทิศกล้อง "หลัง" จากที่ aimbot ดันจุดเล็งแล้ว
+        -- [v2.9] aimBusy = กล้องกำลัง snap/ไกล่ → triggerbot รอจุดเล็งนิ่งก่อนค่อยกด
+        local aimBusy = os.clock() < flickUntil or os.clock() < switchEaseUntil
+        runTriggerBot(camera, aimBusy)
+end))
 -- ==========================================
 -- 10. UI CONSTRUCTION
 -- ==========================================
@@ -1462,4 +1728,23 @@ createToggle("Drag To Switch", State.DragSwitch, function(v) State.DragSwitch = 
 createToggle("Free Steer", State.FreeSteer, function(v) State.FreeSteer = v end)
 createSlider("Flick Speed (°/s)", 60, 300, State.FlickSpeed, 5, function(v)
         State.FlickSpeed = v
+end)
+
+-- [v2.8] Trigger Bot — ยิงเองเมื่อจุดเล็งเข้าเป้า
+createToggle("Trigger Bot", State.TriggerBot, function(v) State.TriggerBot = v end)
+createSlider("Trigger Delay (ms)", 0, 300, State.TriggerDelay, 5, function(v)
+        State.TriggerDelay = v
+end)
+createSlider("Trigger Angle (°)", 0, 3, State.TriggerAngle, 0.1, function(v)
+        State.TriggerAngle = v
+end)
+-- [v2.9] Safe Input = ยิงผ่าน VirtualUser (input ระดับ engine) — ถ้าปืนไม่ตอบสนองค่อยปิด
+-- เพื่อสลับไปใช้ mouse1press ตรง ๆ (เกมบางตัวอ่านคลิกจาก VirtualUser ไม่ครบ)
+createToggle("Trigger Safe Input", State.TriggerSafeInput, function(v)
+        State.TriggerSafeInput = v
+end)
+-- [v2.10] เช็ควัตถุขวางก่อนยิง — ปิดเมื่อไหร่? เกมที่กำแพงบางชั้นไม่บังกระสุนจริง
+-- (raycast บังแต่กระสุนทะลุ) จะทำให้ trigger ยิงขาดจังหวะ — ปิดแล้วยิงได้ตามปกติ
+createToggle("Trigger Wall Check", State.TriggerWallCheck, function(v)
+        State.TriggerWallCheck = v
 end)
